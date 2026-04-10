@@ -24,7 +24,7 @@ def fractal_height(x, y, seed=0, scale=0.01, octaves=5, persistence=0.1, amplitu
             (x + seed) * scale * frequency,
             (y + seed) * scale * frequency
         )
-        # n = 1 - abs(n)
+        # n = 1 - abs(n)        #uncommenting will make look more duney
         height += amp * n
         max_amp += amp
         amp *= persistence
