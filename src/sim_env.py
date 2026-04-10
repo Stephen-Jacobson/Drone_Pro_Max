@@ -5,14 +5,14 @@ import random
 
 seed = random.randint(0, 10000)
 
-x, y, z = 1000, 1000, 100
+x, y, z = 100, 100, 100
 values = np.zeros((x, y, z), dtype=np.uint8)
 
 #gets height per x y spot on grid to give a bumpy terrain, from gpt, for bumpier, increase octaves, persistence, amplitude, for less bumpy, decrease octaves, persistence eg 0.3, lower scale
 # Scale: up - denser bumps, down - wide smooth hills
 # Persistence: up - rough/jagged, down - smooth
 
-def fractal_height(x, y, seed=0, scale=0.01, octaves=5, persistence=0.1, amplitude=100):
+def fractal_height(x, y, seed=seed, scale=0.01, octaves=5, persistence=0.1, amplitude=100):
     height = 0
     frequency = 1
     amp = 1
@@ -40,6 +40,27 @@ def fractal_height(x, y, seed=0, scale=0.01, octaves=5, persistence=0.1, amplitu
     # optional safety clamp (recommended)
     return max(0, min(A, z))
 
+# uses number 1 as block indicator for terrain 
+# uses number 2 as block indicator for trees 
+# uses number 3 as block indicator for tree line
+# added tree line so could stop pathfinder from going above trees 
+def generate_terrain(tree_chance=0.01, tree_height=15, gen_trees=True):
+    for i in range(x):
+        for j in range(y):
+            terr_z = int(fractal_height(i, j))
+            if gen_trees:
+                spawn_tree(i, j, terr_z, tree_height, tree_chance)
+            for k in range(terr_z + 1):
+                values[i][j][k] = 1
+            for k in range(tree_height + 1, z-terr_z):
+                values[i][j][terr_z+k] = 3
+
+def spawn_tree(tx, ty, tz, tree_height, tree_chance):
+    tree = random.random()
+    if tree <= tree_chance:
+        for i in range(1, tree_height + 1):
+            values[tx][ty][tz + i] = 2
+
 def show_grid():
     grid = pv.ImageData()
     grid.dimensions = np.array(values.shape) + 1
@@ -48,21 +69,18 @@ def show_grid():
 
     grid.cell_data["values"] = values.flatten(order="F")
 
-    thresholded = grid.threshold(value=0.5, scalars="values")
+    terrain = grid.threshold([0.5, 1.5], scalars="values")
+    trees = grid.threshold([1.5, 2.5], scalars="values")
+    tree_line = grid.threshold([2.5, 3.5], scalars="values")
     
     plotter = pv.Plotter()
-    plotter.add_mesh(thresholded, show_edges=False, color='#e07a5f')
+    plotter.add_mesh(terrain, show_edges=False, color='#e07a5f')
+    plotter.add_mesh(trees, show_edges=False, color='#432818')
+    plotter.add_mesh(tree_line, show_edges=False, color='#00b4d8', opacity=0.18)
     plotter.show()
 
 def main():
-    for i in range(x):
-        for j in range(y):
-            terr_z = fractal_height(i, j)
-            if terr_z == 0:
-                print("gay")
-            for k in range(int(terr_z)):
-                values[i][j][k] = 1
-    
+    generate_terrain()
     show_grid()
 
 if __name__ == "__main__":
