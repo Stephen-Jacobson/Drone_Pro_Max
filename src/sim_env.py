@@ -2,6 +2,8 @@ import pyvista as pv
 import numpy as np
 from noise import pnoise2
 import random
+from scipy.interpolate import CubicSpline
+from skimage.draw import line
 
 seed = random.randint(0, 10000)
 
@@ -67,28 +69,8 @@ def generate_start_and_end():
 
     # gotta be under tree line but above terrain line
     def _valid_z_values(cx, cy):
-        # column = values[cx][cy]
-
-        # terrain_indices = np.where(column == 1)[0]
-        # if terrain_indices.size == 0:
-        #     return []
-        # terrain_top = int(terrain_indices[-1])
-
-        # tree_line_indices = np.where(column == 3)[0]
-        # tree_line_floor = int(tree_line_indices[0]) if tree_line_indices.size > 0 else z
-
-        # lower = terrain_top + 1
-        # upper = tree_line_floor - 1
-        # if upper < lower:
-        #     return []
-
         valid_levels = list(range(ground_level[cx][cy] + 1, ground_level[cx][cy] + tree_line_height + tree_line_recede))       #valid range of z values based on what will be open
 
-        # valid_levels = []
-        # for cz in range(lower, upper + 1):
-        #     if column[cz] == 1 or column[cz] == 3:
-        #         continue
-        #     valid_levels.append(cz)
         return valid_levels
 
     def _collect_points(x_range, y_range):
@@ -127,6 +109,110 @@ def generate_start_and_end():
             values[start[0]][start[1]][start[2]] = 5
             values[end[0]][end[1]][end[2]] = 4
             return start, end
+    
+def generate_points(
+    start,
+    end,
+    n_points,
+    min_distance=0.0,
+    max_distance=1.0,
+    overlap=0.2
+):
+    start = np.array(start[:2], dtype=float)
+    end = np.array(end[:2], dtype=float)
+
+    direction = end - start
+    length = np.linalg.norm(direction)
+    if length == 0:
+        raise ValueError("Start and end cannot be the same point")
+
+    unit_dir = direction / length
+
+    # perpendicular vector
+    perp = np.array([-unit_dir[1], unit_dir[0]])
+
+    segment_size = 1.0 / (n_points + 1)
+
+    width, height = values.shape[0], values.shape[1]
+
+    points = []
+
+    for i in range(n_points):
+        t_center = (i + 1) * segment_size
+
+        t_min = max(0.0, t_center - segment_size * (0.5 + overlap * 0.5))
+        t_max = min(1.0, t_center + segment_size * (0.5 + overlap * 0.5))
+
+        t = random.uniform(t_min, t_max)
+
+        base_point = start + t * direction
+
+        # --------- MIN/MAX DISTANCE FIX ----------
+        offset_mag = random.uniform(min_distance, max_distance)
+        if random.random() < 0.5:
+            offset_mag *= -1
+
+        point = base_point + perp * offset_mag
+
+        x, y = point
+
+        # --------- BOUNDS CHECK ----------
+        if x < 0 or y < 0 or x >= width or y >= height:
+            continue  # skip invalid points
+
+        x = int(x)
+        y = int(y)
+
+        # --------- SAFE GRID WRITE ----------
+        values[x, y, 0] = 6
+
+        points.append({
+            "point": (x, y),
+            "t": t,
+            "offset": offset_mag,
+            "region": (t_min, t_max)
+        })
+    
+    points.insert(0, {"point": (int(start[0]), int(start[1])), "t": 0.0, "offset": 0, "region": (0, 0)})
+    points.append(   {"point": (int(end[0]),   int(end[1])),   "t": 1.0, "offset": 0, "region": (1, 1)})
+
+
+    return points
+
+def spline_to_grid(points, value=7, num_samples=None):
+    pts = sorted(points, key=lambda p: p["t"])
+
+    t = np.array([p["t"] for p in pts], dtype=float)
+    x = np.array([p["point"][0] for p in pts], dtype=float)
+    y = np.array([p["point"][1] for p in pts], dtype=float)
+
+    cs_x = CubicSpline(t, x)
+    cs_y = CubicSpline(t, y)
+
+    # --- Estimate arc length to guarantee dense enough sampling ---
+    t_est = np.linspace(t.min(), t.max(), 2000)
+    xs_est, ys_est = cs_x(t_est), cs_y(t_est)
+    total_length = np.sum(np.sqrt(np.diff(xs_est)**2 + np.diff(ys_est)**2))
+
+    if num_samples is None:
+        num_samples = max(int(total_length * 3), 500)  # ≥3 samples per pixel
+
+    t_smooth = np.linspace(t.min(), t.max(), num_samples)
+    xs = cs_x(t_smooth)
+    ys = cs_y(t_smooth)
+
+    w, h = values.shape[:2]
+
+    for i in range(len(xs) - 1):
+        x0 = int(round(np.clip(xs[i],     0, w - 1)))
+        y0 = int(round(np.clip(ys[i],     0, h - 1)))
+        x1 = int(round(np.clip(xs[i + 1], 0, w - 1)))
+        y1 = int(round(np.clip(ys[i + 1], 0, h - 1)))
+
+        rr, cc = line(x0, y0, x1, y1)
+
+        for xi, yi in zip(rr, cc):
+            values[xi, yi, 0] = value  # no bounds check needed after clamp
 
 def within_clearance(cx, cy, cz, block_type, clearance=1):
     region = values[
@@ -157,6 +243,8 @@ def replace_within_clearance(cx, cy, cz, block_type, new_type, clearance=1):
 # uses number 3 as block indicator for tree line
 # uses number 4 as block indicator for end block
 # uses number 5 as block indicator for drone
+# uses number 6 as block indicator for possible path blocks
+# uses number 7 as block indicator for path blocks
 # added tree line so could stop pathfinder from going above trees 
 def generate_terrain():
     for i in range(x):
@@ -204,13 +292,19 @@ def show_grid():
     tree_line = grid.threshold([2.5, 3.5], scalars="values")
     end_block = grid.threshold([3.5, 4.5], scalars="values")
     drone_block = grid.threshold([4.5, 5.5], scalars="values")
+    path_points = grid.threshold([5.5, 6.5], scalars="values")
+    path = grid.threshold([6.5, 7.5], scalars="values")
     
     plotter = pv.Plotter()
-    plotter.add_mesh(terrain, show_edges=False, color='#e07a5f')
-    plotter.add_mesh(trees, show_edges=False, color='#432818')
-    plotter.add_mesh(tree_line, show_edges=False, color='#00b4d8', opacity=0.1)
+    plotter.set_background([30, 30, 40])
+
+    # plotter.add_mesh(terrain, show_edges=False, color='#e07a5f')
+    # plotter.add_mesh(trees, show_edges=False, color='#432818')
+    # plotter.add_mesh(tree_line, show_edges=False, color='#00b4d8', opacity=0.1)
     plotter.add_mesh(end_block, show_edges=False, color='#ff0000')
     plotter.add_mesh(drone_block, show_edges=False, color="#00d20e")
+    # plotter.add_mesh(path_points, show_edges=False, color="#f2542d")
+    plotter.add_mesh(path, show_edges=False, color="#ff7d00")
     plotter.show()
 
 def main():
@@ -219,6 +313,8 @@ def main():
     start, end = generate_start_and_end()
     replace_within_clearance(start[0], start[1], start[2], 2, 0)
     replace_within_clearance(end[0], end[1], end[2], 2, 0)
+    points = generate_points(start, end, 20, 30, 80)
+    spline_to_grid(points)
     print(f"Start: {start}, End: {end}")
     show_grid()
 

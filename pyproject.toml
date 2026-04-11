@@ -13,4 +13,6 @@ dependencies = [
     "pyvista>=0.47.2",
     "stable-baselines3>=2.8.0",
     "torch>=2.11.0",
+    "scikit-image>=0.26.0",
+    "scipy>=1.17.1",
 ]
