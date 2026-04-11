@@ -43,7 +43,87 @@ def fractal_height(x, y, seed=seed, scale=scale, octaves=5, persistence=0.01, am
 
 # TODO generate random start and end points on map
 
-# def generate_start_and_end():
+def generate_start_and_end():
+    edge_band = max(1, int(min(x, y) * 0.2))
+    minimum_span = int(min(x, y) * 0.6)
+
+    def _tree_clear(cx, cy, cz, clearance=1):
+        x_min = max(0, cx - clearance)
+        x_max = min(x - 1, cx + clearance)
+        y_min = max(0, cy - clearance)
+        y_max = min(y - 1, cy + clearance)
+        z_min = max(0, cz - clearance)
+        z_max = min(z - 1, cz + clearance)
+        for nx in range(x_min, x_max + 1):
+            for ny in range(y_min, y_max + 1):
+                for nz in range(z_min, z_max + 1):
+                    if values[nx][ny][nz] == 2:
+                        return False
+        return True
+
+    # gotta be under tree line but above terrain line
+    def _valid_z_values(cx, cy):
+        column = values[cx][cy]
+
+        terrain_indices = np.where(column == 1)[0]
+        if terrain_indices.size == 0:
+            return []
+        terrain_top = int(terrain_indices[-1])
+
+        tree_line_indices = np.where(column == 3)[0]
+        tree_line_floor = int(tree_line_indices[0]) if tree_line_indices.size > 0 else z
+
+        lower = terrain_top + 1
+        upper = tree_line_floor - 1
+        if upper < lower:
+            return []
+
+        valid_levels = []
+        for cz in range(lower, upper + 1):
+            if column[cz] != 0:
+                continue
+            if _tree_clear(cx, cy, cz):
+                valid_levels.append(cz)
+        return valid_levels
+
+    def _collect_points(x_range, y_range):
+        points = []
+        for cx in x_range:
+            for cy in y_range:
+                z_levels = _valid_z_values(cx, cy)
+                if z_levels:
+                    points.append((cx, cy, random.choice(z_levels)))
+        return points
+
+    left_points = _collect_points(range(0, edge_band), range(0, y))
+    right_points = _collect_points(range(x - edge_band, x), range(0, y))
+    bottom_points = _collect_points(range(0, x), range(0, edge_band))
+    top_points = _collect_points(range(0, x), range(y - edge_band, y))
+
+    pair_options = [
+        (left_points, right_points),
+        (bottom_points, top_points),
+    ]
+    random.shuffle(pair_options)
+
+    for side_a, side_b in pair_options:
+        if not side_a or not side_b:
+            continue
+
+        start = random.choice(side_a)
+        end = max(
+            side_b,
+            key=lambda p: (p[0] - start[0]) ** 2 + (p[1] - start[1]) ** 2,
+        )
+
+        span = ((start[0] - end[0]) ** 2 + (start[1] - end[1]) ** 2) ** 0.5
+        if span >= minimum_span:
+            # Mark positions in grid: 5 for drone/start, 4 for end
+            values[start[0]][start[1]][start[2]] = 5
+            values[end[0]][end[1]][end[2]] = 4
+            return start, end
+
+
 
 # TODO generate random points until end, maybe with changable varyation
 # like can be a very winding path or points are more in a line shape, then connect points using cubic splines which will create smooth path
@@ -54,6 +134,8 @@ def fractal_height(x, y, seed=seed, scale=scale, octaves=5, persistence=0.01, am
 # uses number 1 as block indicator for terrain 
 # uses number 2 as block indicator for trees 
 # uses number 3 as block indicator for tree line
+# uses number 4 as block indicator for end block
+# uses number 5 as block indicator for drone
 # added tree line so could stop pathfinder from going above trees 
 def generate_terrain(tree_chance=0.01, tree_height=15, gen_trees=True, tree_line_height=15, tree_line_recede=0):
     for i in range(x):
@@ -91,15 +173,21 @@ def show_grid():
     terrain = grid.threshold([0.5, 1.5], scalars="values")
     trees = grid.threshold([1.5, 2.5], scalars="values")
     tree_line = grid.threshold([2.5, 3.5], scalars="values")
+    end_block = grid.threshold([3.5, 4.5], scalars="values")
+    drone_block = grid.threshold([4.5, 5.5], scalars="values")
     
     plotter = pv.Plotter()
     plotter.add_mesh(terrain, show_edges=False, color='#e07a5f')
     plotter.add_mesh(trees, show_edges=False, color='#432818')
     plotter.add_mesh(tree_line, show_edges=False, color='#00b4d8', opacity=0.1)
+    plotter.add_mesh(end_block, show_edges=False, color='#ff0000')
+    plotter.add_mesh(drone_block, show_edges=False, color='#ff69b4')
     plotter.show()
 
 def main():
     generate_terrain()
+    start, end = generate_start_and_end()
+    print(f"Start: {start}, End: {end}")
     show_grid()
 
 if __name__ == "__main__":
