@@ -5,9 +5,13 @@ import random
 
 seed = random.randint(0, 10000)
 
-x, y, z = 100, 100, 100
+x, y, z = 1000, 100, 100
 scale = 0.01
-values = np.zeros((x, y, z), dtype=np.uint8)
+values = np.zeros((x, y, z), dtype=np.uint8)        #smallest dtype so that takes least amount of memory - 0-255
+ground_level = np.zeros((x,y), dtype=np.uint16)     #bigger but still small, must hold ground levl values - 0-65535
+
+tree_line_height = 15
+tree_line_recede = 0
 
 #gets height per x y spot on grid to give a bumpy terrain, from gpt, for bumpier, increase octaves, persistence, amplitude, for less bumpy, decrease octaves, persistence eg 0.3, lower scale
 # Scale: up - denser bumps, down - wide smooth hills
@@ -63,27 +67,28 @@ def generate_start_and_end():
 
     # gotta be under tree line but above terrain line
     def _valid_z_values(cx, cy):
-        column = values[cx][cy]
+        # column = values[cx][cy]
 
-        terrain_indices = np.where(column == 1)[0]
-        if terrain_indices.size == 0:
-            return []
-        terrain_top = int(terrain_indices[-1])
+        # terrain_indices = np.where(column == 1)[0]
+        # if terrain_indices.size == 0:
+        #     return []
+        # terrain_top = int(terrain_indices[-1])
 
-        tree_line_indices = np.where(column == 3)[0]
-        tree_line_floor = int(tree_line_indices[0]) if tree_line_indices.size > 0 else z
+        # tree_line_indices = np.where(column == 3)[0]
+        # tree_line_floor = int(tree_line_indices[0]) if tree_line_indices.size > 0 else z
 
-        lower = terrain_top + 1
-        upper = tree_line_floor - 1
-        if upper < lower:
-            return []
+        # lower = terrain_top + 1
+        # upper = tree_line_floor - 1
+        # if upper < lower:
+        #     return []
 
-        valid_levels = []
-        for cz in range(lower, upper + 1):
-            if column[cz] != 0:
-                continue
-            if _tree_clear(cx, cy, cz):
-                valid_levels.append(cz)
+        valid_levels = list(range(ground_level[cx][cy] + 1, ground_level[cx][cy] + tree_line_height + tree_line_recede))       #valid range of z values based on what will be open
+
+        # valid_levels = []
+        # for cz in range(lower, upper + 1):
+        #     if column[cz] == 1 or column[cz] == 3:
+        #         continue
+        #     valid_levels.append(cz)
         return valid_levels
 
     def _collect_points(x_range, y_range):
@@ -123,6 +128,22 @@ def generate_start_and_end():
             values[end[0]][end[1]][end[2]] = 4
             return start, end
 
+def within_clearance(cx, cy, cz, block_type, clearance=1):
+    region = values[
+        max(0, cx-clearance):cx+clearance+1,
+        max(0, cy-clearance):cy+clearance+1,
+        max(0, cz-clearance):cz+clearance+1
+    ]
+    return (region == block_type).any()
+
+def replace_within_clearance(cx, cy, cz, block_type, new_type, clearance=1):
+    region = values[
+        max(0, cx-clearance):cx+clearance+1,
+        max(0, cy-clearance):cy+clearance+1,
+        max(0, cz-clearance):cz+clearance+1
+    ]
+
+    region[region == block_type] = new_type
 
 
 # TODO generate random points until end, maybe with changable varyation
@@ -137,13 +158,12 @@ def generate_start_and_end():
 # uses number 4 as block indicator for end block
 # uses number 5 as block indicator for drone
 # added tree line so could stop pathfinder from going above trees 
-def generate_terrain(tree_chance=0.01, tree_height=15, gen_trees=True, tree_line_height=15, tree_line_recede=0):
+def generate_terrain():
     for i in range(x):
         for j in range(y):
             terr_z = int(fractal_height(i, j))
-            if gen_trees:
-                tile_num = i * y + j
-                spawn_tree(i, j, terr_z, tree_height, tree_chance, tile_num)
+            ground_level[i][j] = terr_z
+            
             for k in range(terr_z + 1):
                 values[i][j][k] = 1
             # if scale > 0.7:
@@ -154,6 +174,15 @@ def generate_terrain(tree_chance=0.01, tree_height=15, gen_trees=True, tree_line
                 if values[i][j][terr_z + k] == 0 and terr_z + k > recede:
                         
                     values[i][j][terr_z + k] = 3
+
+def generate_trees(tree_chance=0.01, tree_height=15, gen_trees=True):
+    if gen_trees:
+        for i in range(x):
+            for j in range(y):
+                terr_z = ground_level[i][j]
+                
+                tile_num = i * y + j
+                spawn_tree(i, j, terr_z, tree_height, tree_chance, tile_num)
 
 def spawn_tree(tx, ty, tz, tree_height, tree_chance, tile_num):
     random.seed(seed + tile_num)
@@ -181,12 +210,15 @@ def show_grid():
     plotter.add_mesh(trees, show_edges=False, color='#432818')
     plotter.add_mesh(tree_line, show_edges=False, color='#00b4d8', opacity=0.1)
     plotter.add_mesh(end_block, show_edges=False, color='#ff0000')
-    plotter.add_mesh(drone_block, show_edges=False, color='#ff69b4')
+    plotter.add_mesh(drone_block, show_edges=False, color="#00d20e")
     plotter.show()
 
 def main():
     generate_terrain()
+    generate_trees()
     start, end = generate_start_and_end()
+    replace_within_clearance(start[0], start[1], start[2], 2, 0)
+    replace_within_clearance(end[0], end[1], end[2], 2, 0)
     print(f"Start: {start}, End: {end}")
     show_grid()
 
