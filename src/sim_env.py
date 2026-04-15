@@ -8,7 +8,7 @@ from skimage.draw import line
 seed = random.randint(0, 10000)
 
 x, y, z = 1000, 100, 100
-scale = 0.01
+scale = 0.1
 values = np.zeros((x, y, z), dtype=np.uint8)        #smallest dtype so that takes least amount of memory - 0-255
 ground_level = np.zeros((x,y), dtype=np.uint16)     #bigger but still small, must hold ground levl values - 0-65535
 
@@ -67,17 +67,11 @@ def generate_start_and_end():
                         return False
         return True
 
-    # gotta be under tree line but above terrain line
-    def _valid_z_values(cx, cy):
-        valid_levels = list(range(ground_level[cx][cy] + 1, ground_level[cx][cy] + tree_line_height + tree_line_recede))       #valid range of z values based on what will be open
-
-        return valid_levels
-
     def _collect_points(x_range, y_range):
         points = []
         for cx in x_range:
             for cy in y_range:
-                z_levels = _valid_z_values(cx, cy)
+                z_levels = valid_z_values(cx, cy)
                 if z_levels:
                     points.append((cx, cy, random.choice(z_levels)))
         return points
@@ -109,6 +103,11 @@ def generate_start_and_end():
             values[start[0]][start[1]][start[2]] = 5
             values[end[0]][end[1]][end[2]] = 4
             return start, end
+
+def valid_z_values(cx, cy):
+    valid_levels = list(range(ground_level[cx][cy] + 1, ground_level[cx][cy] + tree_line_height + tree_line_recede))       #valid range of z values based on what will be open
+
+    return valid_levels
     
 def generate_points(
     start,
@@ -298,13 +297,13 @@ def show_grid():
     plotter = pv.Plotter()
     plotter.set_background([30, 30, 40])
 
-    # plotter.add_mesh(terrain, show_edges=False, color='#e07a5f')
-    # plotter.add_mesh(trees, show_edges=False, color='#432818')
-    # plotter.add_mesh(tree_line, show_edges=False, color='#00b4d8', opacity=0.1)
+    plotter.add_mesh(terrain, show_edges=False, color='#e07a5f')
+    plotter.add_mesh(trees, show_edges=False, color='#432818')
+    plotter.add_mesh(tree_line, show_edges=False, color='#00b4d8', opacity=0.1)
     plotter.add_mesh(end_block, show_edges=False, color='#ff0000')
     plotter.add_mesh(drone_block, show_edges=False, color="#00d20e")
     # plotter.add_mesh(path_points, show_edges=False, color="#f2542d")
-    plotter.add_mesh(path, show_edges=False, color="#ff7d00")
+    # plotter.add_mesh(path, show_edges=False, color="#ff7d00")
     plotter.show()
 
 def main():
