@@ -5,6 +5,8 @@ import random
 from scipy.interpolate import CubicSpline
 from skimage.draw import line
 
+from drone import Drone
+
 pv.global_theme.allow_empty_mesh = True
 
 seed = random.randint(0, 10000)
@@ -281,35 +283,38 @@ def spawn_tree(tx, ty, tz, tree_height, tree_chance, tile_num):
         for i in range(1, tree_height + 1):
             values[tx][ty][tz + i] = 2
 
-def show_grid():
+def show_grid(drone=None):
     grid = pv.ImageData()
     grid.dimensions = np.array(values.shape) + 1
     grid.spacing = (1, 1, 1)
     grid.origin = (0, 0, 0)
-
     grid.cell_data["values"] = values.flatten(order="F")
 
-    terrain = grid.threshold([0.5, 1.5], scalars="values")
-    trees = grid.threshold([1.5, 2.5], scalars="values")
-    tree_line = grid.threshold([2.5, 3.5], scalars="values")
-    end_block = grid.threshold([3.5, 4.5], scalars="values")
-    drone_block = grid.threshold([4.5, 5.5], scalars="values")
-    path_points = grid.threshold([5.5, 6.5], scalars="values")
-    path = grid.threshold([6.5, 7.5], scalars="values")
-    # surroundings = grid.threshold([7.5, 8.5], scalars="values")
-    
+    terrain      = grid.threshold([0.5, 1.5], scalars="values")
+    trees        = grid.threshold([1.5, 2.5], scalars="values")
+    tree_line    = grid.threshold([2.5, 3.5], scalars="values")
+    end_block    = grid.threshold([3.5, 4.5], scalars="values")
+    drone_block  = grid.threshold([4.5, 5.5], scalars="values")
+    path         = grid.threshold([6.5, 7.5], scalars="values")
+
     plotter = pv.Plotter()
     plotter.set_background([30, 30, 40])
-
     plotter.add_mesh(terrain, show_edges=False, color='#e07a5f')
     plotter.add_mesh(trees, show_edges=False, color='#432818')
     plotter.add_mesh(tree_line, show_edges=False, color='#00b4d8', opacity=0.1)
     plotter.add_mesh(end_block, show_edges=False, color='#ff0000')
     plotter.add_mesh(drone_block, show_edges=False, color="#00d20e")
-    # plotter.add_mesh(surroundings, show_edges=False, color="#ffb703", opacity=0.4)
-    # plotter.add_mesh(path_points, show_edges=False, color="#f2542d")
-    # plotter.add_mesh(path, show_edges=False, color="#ff7d00")
-    plotter.show()
+    plotter.add_mesh(path, show_edges=False, color='#ff7d00')
+
+    drone_point = None
+    if drone is not None:
+        drone_point = pv.Cube(center=drone.pos, x_length=1, y_length=1, z_length=1)
+        plotter.add_mesh(drone_point, color='#f15bb5')
+        plotter.show(interactive_update=True)
+    else:
+        plotter.show()
+
+    return plotter, drone_point
 
 def main():
     generate_terrain()
@@ -320,7 +325,21 @@ def main():
     points = generate_points(start, end, 20, 30, 80)
     spline_to_grid(points)
     print(f"Start: {start}, End: {end}")
-    show_grid()
+
+    drone = Drone(id=0, sight_range=10, values=values, pos=start, goal=end)
+    plotter, drone_point = show_grid(drone)
+    assert drone_point is not None
+
+    prev_pos = drone.pos.copy()
+
+    def step(caller):
+        direction = np.random.uniform(-1, 1, size=3)
+        drone.move(direction, amount=1)
+        drone_point.translate(drone.pos - prev_pos, inplace=True)
+        prev_pos[:] = drone.pos
+
+    plotter.add_timer_event(max_steps=1000, duration=300, callback=step)
+    plotter.show()
 
 if __name__ == "__main__":
     main()
