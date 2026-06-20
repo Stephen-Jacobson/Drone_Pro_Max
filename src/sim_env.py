@@ -9,7 +9,7 @@ pv.global_theme.allow_empty_mesh = True
 
 seed = random.randint(0, 10000)
 
-x, y, z = 10, 10, 100
+x, y, z = 100, 100, 100
 scale = 0.01
 values = np.zeros((x, y, z), dtype=np.uint8)        #smallest dtype so that takes least amount of memory - 0-255
 ground_level = np.zeros((x,y), dtype=np.uint16)     #bigger but still small, must hold ground levl values - 0-65535
@@ -42,7 +42,6 @@ def fractal_height(x, y, seed=seed, scale=scale, octaves=5, persistence=0.01, am
 
     # normalize to [-1, 1]
     height /= max_amp
-
     # map to [0, A]
     A = amplitude
     z = (height + 1) * (A / 2)
@@ -282,94 +281,6 @@ def spawn_tree(tx, ty, tz, tree_height, tree_chance, tile_num):
         for i in range(1, tree_height + 1):
             values[tx][ty][tz + i] = 2
 
-def mark_voxel(x, y, z, thickness=0):
-    # numpy slice instead of triple Python loop — ~27x faster
-    x0 = max(0, x - thickness);  x1 = min(values.shape[0], x + thickness + 1)
-    y0 = max(0, y - thickness);  y1 = min(values.shape[1], y + thickness + 1)
-    z0 = max(0, z - thickness);  z1 = min(values.shape[2], z + thickness + 1)
-    slab = values[x0:x1, y0:y1, z0:z1]
-    slab[~np.isin(slab, [1, 2, 4, 5])] = 8
-
-def cast_all_rays(origin, directions, max_range, thickness=1):
-    """March ALL rays together each step instead of one at a time."""
-    N = len(directions)
-    d = directions / np.linalg.norm(directions, axis=1, keepdims=True)  # (N,3)
-
-    with np.errstate(divide='ignore', invalid='ignore'):  # silences the warnings
-        step  = np.sign(d).astype(int)                                      # (N,3)
-        delta = np.where(np.abs(d) < 1e-9, np.inf, np.abs(1.0 / d))       # (N,3)
-        tmax  = np.where(
-            np.abs(d) < 1e-9,
-            np.inf,
-            ((np.floor(origin) + (step > 0)) - origin) / d                 # (N,3)
-        )
-
-    xyz    = np.tile(np.floor(origin).astype(int), (N, 1))  # (N,3) — all start positions
-    active = np.ones(N, dtype=bool)
-
-    max_steps = int(max_range * np.sqrt(3)) + 10  # guaranteed to cover full range
-
-    for _ in range(max_steps):
-        if not active.any():
-            break
-
-        ai = np.where(active)[0]
-        x, y, z = xyz[ai, 0], xyz[ai, 1], xyz[ai, 2]
-
-        # --- bounds check (vectorised) ---
-        in_bounds = (
-            (x >= 0) & (x < values.shape[0]) &
-            (y >= 0) & (y < values.shape[1]) &
-            (z >= 0) & (z < values.shape[2])
-        )
-        active[ai[~in_bounds]] = False
-
-        ib = ai[in_bounds]
-        if not len(ib):
-            break
-
-        xb, yb, zb = xyz[ib, 0], xyz[ib, 1], xyz[ib, 2]
-        vals = values[xb, yb, zb]
-
-        # --- stop rays that hit solid ---
-        hit = np.isin(vals, [1, 2])
-        active[ib[hit]] = False
-
-        # --- mark free voxels ---
-        to_mark = ib[~hit & ~np.isin(vals, [4, 5])]
-        for i in to_mark:                        # only unmarked voxels, not every ray
-            mark_voxel(xyz[i, 0], xyz[i, 1], xyz[i, 2], thickness)
-
-        # --- advance all still-active rays ---
-        still = np.where(active)[0]
-        if not len(still):
-            break
-
-        ax     = np.argmin(tmax[still], axis=1)  # which axis to step each ray
-        t_next = tmax[still, ax]
-
-        # deactivate rays that have exceeded max_range
-        done = t_next >= max_range
-        active[still[done]] = False
-
-        go    = still[~done]
-        ax_go = ax[~done]
-        tmax[go, ax_go] += delta[go, ax_go]
-        xyz [go, ax_go] += step [go, ax_go]
-
-def fibonacci_sphere_directions(n_rays, jitter=0.3):
-    golden = np.pi * (3 - np.sqrt(5))
-    i      = np.arange(n_rays, dtype=float)
-    y      = np.clip(1 - ((i + np.random.uniform(-jitter, jitter, n_rays)) / (n_rays - 1)) * 2, -1, 1)
-    r      = np.sqrt(1 - y * y)
-    theta  = golden * i
-    return np.column_stack([np.cos(theta) * r, y, np.sin(theta) * r])
-
-def get_lidar_surroundings(org, max_range=10, n_rays=300):
-    print(f"Casting {n_rays} rays (vectorised)")
-    directions = fibonacci_sphere_directions(n_rays)
-    cast_all_rays(org, directions, max_range, thickness=1)
-
 def show_grid():
     grid = pv.ImageData()
     grid.dimensions = np.array(values.shape) + 1
@@ -385,7 +296,7 @@ def show_grid():
     drone_block = grid.threshold([4.5, 5.5], scalars="values")
     path_points = grid.threshold([5.5, 6.5], scalars="values")
     path = grid.threshold([6.5, 7.5], scalars="values")
-    surroundings = grid.threshold([7.5, 8.5], scalars="values")
+    # surroundings = grid.threshold([7.5, 8.5], scalars="values")
     
     plotter = pv.Plotter()
     plotter.set_background([30, 30, 40])
@@ -395,7 +306,7 @@ def show_grid():
     plotter.add_mesh(tree_line, show_edges=False, color='#00b4d8', opacity=0.1)
     plotter.add_mesh(end_block, show_edges=False, color='#ff0000')
     plotter.add_mesh(drone_block, show_edges=False, color="#00d20e")
-    plotter.add_mesh(surroundings, show_edges=False, color="#ffb703", opacity=0.4)
+    # plotter.add_mesh(surroundings, show_edges=False, color="#ffb703", opacity=0.4)
     # plotter.add_mesh(path_points, show_edges=False, color="#f2542d")
     # plotter.add_mesh(path, show_edges=False, color="#ff7d00")
     plotter.show()
@@ -406,7 +317,6 @@ def main():
     start, end = generate_start_and_end()
     replace_within_clearance(start[0], start[1], start[2], 2, 0)
     replace_within_clearance(end[0], end[1], end[2], 2, 0)
-    get_lidar_surroundings(start)
     points = generate_points(start, end, 20, 30, 80)
     spline_to_grid(points)
     print(f"Start: {start}, End: {end}")
