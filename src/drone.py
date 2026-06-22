@@ -14,16 +14,19 @@ class Drone(object):
         self.values = values
 
     def move(self, direction, amount=1):
-            direction = np.array(direction, dtype=np.float32)
-            direction = direction / (np.linalg.norm(direction) + 1e-8)  # normalise
+        direction = np.array(direction, dtype=np.float32)
+        
+        # guard against NaN actions
+        if np.any(np.isnan(direction)) or np.any(np.isinf(direction)):
+            return
+        
+        direction = direction / (np.linalg.norm(direction) + 1e-8)
+        new_pos = self.pos + direction * amount
+        new_pos = np.clip(new_pos, 0, np.array(self.values.shape) - 1)
     
-            new_pos = self.pos + direction * amount
-            new_pos = np.clip(new_pos, 0, np.array(self.values.shape) - 1)  # stay in bounds
-    
-            # clear old pos, set new pos in grid
-            self.values[int(self.pos[0]), int(self.pos[1]), int(self.pos[2])] = 0
-            self.pos = new_pos
-            self.values[int(self.pos[0]), int(self.pos[1]), int(self.pos[2])] = 5
+        self.values[int(self.pos[0]), int(self.pos[1]), int(self.pos[2])] = 0
+        self.pos = new_pos
+        self.values[int(self.pos[0]), int(self.pos[1]), int(self.pos[2])] = 5
     
     def get_id(self):
         return self.id

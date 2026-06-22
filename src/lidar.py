@@ -64,7 +64,7 @@ def cast_all_rays(values, origin, directions, max_range, thickness=1):
         # --- mark free voxels ---
         to_mark = ib[~hit & ~np.isin(vals, [4, 5])]
         for i in to_mark:                        # only unmarked voxels, not every ray
-            mark_voxel(xyz[i, 0], xyz[i, 1], xyz[i, 2], thickness)
+            mark_voxel(values, xyz[i, 0], xyz[i, 1], xyz[i, 2], thickness)
 
         # --- advance all still-active rays ---
         still = np.where(active)[0]
@@ -93,8 +93,8 @@ def fibonacci_sphere_directions(n_rays, jitter=0.3):
     theta  = golden * i
     return np.column_stack([np.cos(theta) * r, y, np.sin(theta) * r])
 
-def get_lidar_surroundings(values, org, max_range=10, n_rays=300):
-    print(f"Casting {n_rays} rays (vectorised)")
+def get_lidar_surroundings(values, org, max_range=10, n_rays=100):
+    # print(f"Casting {n_rays} rays (vectorised)")
     directions = fibonacci_sphere_directions(n_rays)
     distances = cast_all_rays(values, org, directions, max_range, thickness=1)
     obs = distances / max_range

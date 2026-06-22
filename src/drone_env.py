@@ -1,7 +1,7 @@
 import numpy as np
 
 from torchrl.envs import EnvBase
-from torchrl.data import BoundedTensorSpec, CompositeSpec, UnboundedContinuousTensorSpec
+from torchrl.data import Bounded, Composite, Unbounded
 import torch
 
 from tensordict import TensorDict
@@ -10,45 +10,50 @@ from drone import Drone
 import lidar
 
 class DroneEnv(EnvBase):
-    def __init__(self, values, start, end, n_rays=300, sight_range=10):
+    def __init__(self, values, start, end, n_rays=100, sight_range=10):
+        super().__init__()
         self.values = values
         self.start = np.array(start, dtype=np.float32)
         self.end   = np.array(end,   dtype=np.float32)
         self.n_rays = n_rays
         self.sight_range = sight_range
         self.drone = Drone(0, self.sight_range, self.values, self.start, self.end)
+        self.path_history = []              # in order to visually show first run of batch
+        self.record = False
 
         obs_size = n_rays + 4           # number of lidar rays + direction(3) + is_done
         
         # do these calls so TorchRL knows what to expect and what shape and size shit will be when it works with this env
-        self.observation_space = CompositeSpec(
-            UnboundedContinuousTensorSpec(shape=(obs_size,))
+        self.observation_spec = Composite(
+            observation=Unbounded(shape=(obs_size,))
         )
-        self.action_spec = BoundedTensorSpec(
+        self.action_spec = Bounded(
             low=-1, high=1, shape=(3,)
         )
 
-        self.reward_spec = UnboundedContinuousTensorSpec(shape=(1,))
+        self.reward_spec = Unbounded(shape=(1,))
         
     def _step(self, tensordict):
-        action = tensordict["action"].numpy()
+        action = tensordict["action"].cpu().numpy()
         prev_pos = self.drone.pos.copy()
-
         self.drone.move(action, amount=1)
+        if self.record:
+            self.path_history.append(self.drone.pos.copy())
+            
         obs = self._get_obs()
         reward = self._get_reward(prev_pos)
         done = self._is_done()
 
         return TensorDict({
-            "observation": torch.tensor(obs),
-            "reward": torch.tensor([reward], dtype=torch.float32),
-            "done": torch.tensor([done]),
+            "observation": torch.tensor(obs, device=self.device),
+            "reward": torch.tensor([reward], dtype=torch.float32, device=self.device),
+            "done": torch.tensor([done], device=self.device),
         }, batch_size=[])
 
     def _reset(self, tensordict=None, **kwargs):
         self.drone = Drone(0, self.sight_range, self.values, self.start, self.end)
         obs = self._get_obs()
-        return TensorDict({"observation": torch.tensor(obs)}, batch_size=[])
+        return TensorDict({"observation": torch.tensor(obs, device=self.device)}, batch_size=[])
 
     def _get_obs(self):
         scan = lidar.get_lidar_surroundings(self.values, self.drone.pos, self.sight_range)

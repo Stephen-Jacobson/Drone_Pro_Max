@@ -283,6 +283,26 @@ def spawn_tree(tx, ty, tz, tree_height, tree_chance, tile_num):
         for i in range(1, tree_height + 1):
             values[tx][ty][tz + i] = 2
 
+def show_path(path_history):
+    grid = pv.ImageData()
+    grid.dimensions = np.array(values.shape) + 1
+    grid.spacing = (1, 1, 1)
+    grid.origin = (0, 0, 0)
+    grid.cell_data["values"] = values.flatten(order="F")
+
+    plotter = pv.Plotter()
+    plotter.set_background([30, 30, 40])
+    plotter.add_mesh(grid.threshold([0.5, 1.5], scalars="values"), color='#e07a5f')
+    plotter.add_mesh(grid.threshold([1.5, 2.5], scalars="values"), color='#432818')
+    plotter.add_mesh(grid.threshold([3.5, 4.5], scalars="values"), color='#ff0000')
+
+    if len(path_history) > 1:
+        pts = np.array(path_history, dtype=np.float32)
+        spline = pv.Spline(pts, len(pts) * 10)
+        plotter.add_mesh(spline, color='#00d20e', line_width=3)
+
+    plotter.show()
+
 def show_grid(drone=None):
     grid = pv.ImageData()
     grid.dimensions = np.array(values.shape) + 1
