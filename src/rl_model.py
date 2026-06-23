@@ -36,6 +36,7 @@ from torch import multiprocessing
 # ... all imports ...
  
 MAX_STEPS = 500
+VISUALISE = False
 
 if __name__ == "__main__":
     is_fork = multiprocessing.get_start_method() == "fork"
@@ -61,26 +62,32 @@ if __name__ == "__main__":
         # Will do that num_epoch number of times, eg 10, therefore will have (1000/64)*10 = ~156 gradient updates. At each epoch gradient/model 
         # updates ~15 times, so model updates every 64 taken from 1000, ie ~156
     sub_batch_size = 256
-    num_epochs = 10
+    num_epochs = 15
     clip_epsilon = 0.2              # stops policy from updating too much in one steps, 0.2 will stop from updating when change is more than 20%
-    gamma = 0.99                    # between 0-1, closer to 1, worries more about future rewards, closer to 0, worries more about immediate rewards
+    gamma = 0.95                    # between 0-1, closer to 1, worries more about future rewards, closer to 0, worries more about immediate rewards
     lmbda = 0.95                    # used to compute advantage of move, ie was it better or worse than the expaected reward which our critic calculates
     entropy_eps = 0.01              # rewards exploration at beginning of training so model doesnt commit to badd moves, less important later in training
     
-    # generate the environment
-    sim.generate_terrain()
-    sim.generate_trees()
-    start, end = sim.generate_start_and_end()
-    sim.replace_within_clearance(start[0], start[1], start[2], 2, 0)
-    sim.replace_within_clearance(end[0], end[1], end[2], 2, 0)
-    
-    base_env = DroneEnv(sim.values, start, end)
-    
+    def build_world():
+        """Generate a fresh terrain and return start, end, and a clean grid snapshot."""
+        sim.reseed()
+        sim.values[:] = 0
+        sim.ground_level[:] = 0
+        sim.generate_terrain()
+        sim.generate_trees()
+        start, end = sim.generate_start_and_end()
+        sim.replace_within_clearance(start[0], start[1], start[2], 2, 0)
+        sim.replace_within_clearance(end[0], end[1], end[2], 2, 0)
+        clean = sim.values.copy()  # snapshot BEFORE any worker touches it
+        return start, end, clean
+
+    start, end, clean_grid = build_world()
+
     def make_env():
-        v = sim.values.copy()  # each env needs its own grid
+        v = clean_grid.copy()  # each env gets its own copy of the guaranteed-clean grid
         return DroneEnv(v, start, end)
-    
-    base_env = ParallelEnv(24, make_env)  # 16 envs at once
+
+    base_env = ParallelEnv(24, make_env)
     env = TransformedEnv(base_env, StepCounter(max_steps=MAX_STEPS))
     env = env.to(device)
     
@@ -168,18 +175,58 @@ if __name__ == "__main__":
     pbar = tqdm(total=total_steps)
     eval_str = ""
     
-    # We iterate over the collector until it reaches the total number of frames it was
-    # designed to collect:
-    for i, tensordict_data in enumerate(collector):
-        # visualise first rollout of every 10th batch
-        if i % 10 == 0:
-            base_env.path_history = []
-            base_env.record = True
+    REGEN_EVERY = 10  # new world every N batches (~104 batches total)
+
+    # `for i, x in enumerate(collector)` would only call iter(collector) ONCE, up front.
+    # Reassigning the `collector` variable inside the loop body (on regen) does NOT change
+    # what that already-bound iterator pulls from — it keeps calling next() on the OLD,
+    # now-shutdown() collector, whose internal `_final_rollout` has been torn down. That's
+    # the source of `AttributeError: 'Collector' object has no attribute '_final_rollout'`.
+    # Driving the iterator manually lets us actually swap it out after a regen.
+    frames_collected = 0
+    i = 0
+    collector_iter = iter(collector)
+
+    while frames_collected < total_steps:
+        try:
+            tensordict_data = next(collector_iter)
+        except StopIteration:
+            break
+
+        # regenerate terrain periodically so the model trains on varied worlds
+        if i > 0 and i % REGEN_EVERY == 0:
+            start, end, clean_grid = build_world()
+            # collector.shutdown() already closed base_env — don't call base_env.close()
+            collector.shutdown()
+            base_env = ParallelEnv(24, make_env)
+            env = TransformedEnv(base_env, StepCounter(max_steps=MAX_STEPS))
+            env = env.to(device)
+            collector = Collector(
+                env,
+                policy_module,
+                frames_per_batch=steps_per_batch,
+                total_frames=total_steps - frames_collected,
+                split_trajs=False,
+                device=device,
+            )
+            collector_iter = iter(collector)
+
+        # visualise one rollout every 10th batch via a standalone env
+        # (base_env is a ParallelEnv proxy — path_history/record don't reach workers)
+        if i % 50 == 0 and VISUALISE:
+            vis_env = DroneEnv(clean_grid.copy(), start, end)
+            vis_env.record = True
+            td_vis = vis_env.reset()
             with set_exploration_type(ExplorationType.DETERMINISTIC), torch.no_grad():
-                env.rollout(MAX_STEPS, policy_module)
-            base_env.record = False
-            # path_copy = base_env.path_history.copy()
-            # threading.Thread(target=sim.show_path, args=(path_copy,), daemon=True).start()
+                for _ in range(MAX_STEPS):
+                    td_vis = td_vis.to(device)
+                    td_vis = policy_module(td_vis)
+                    td_vis = vis_env._step(td_vis)
+                    if td_vis["done"].item():
+                        break
+                    td_vis = td_vis.select("observation")
+            path_copy = vis_env.path_history.copy()
+            threading.Thread(target=sim.show_path, args=(path_copy, clean_grid.copy()), daemon=True).start()
     
         for _ in range(num_epochs):
             advantage_module(tensordict_data)
@@ -221,11 +268,14 @@ if __name__ == "__main__":
                 del eval_rollout
         pbar.set_description(", ".join([eval_str, cum_reward_str, stepcount_str, lr_str]))
         scheduler.step()
+
+        frames_collected += tensordict_data.numel()
+        i += 1
     
     torch.save({
         "policy": policy_module.state_dict(),
         "value":  value_module.state_dict(),
-    }, "drone_model.pt")
+    }, "drone_model_v2.pt")
     print("model saved")
 
     plt.figure(figsize=(10, 10))

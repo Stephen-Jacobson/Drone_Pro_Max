@@ -17,6 +17,7 @@ from drone_env import DroneEnv
 from drone import Drone
 import pyvista as pv
 
+FOLLOW = True
 MAX_STEPS = 500
 num_cells = 256
 
@@ -79,7 +80,7 @@ def main():
     with torch.no_grad():
         policy(dummy)
 
-    model_path = os.path.join(os.path.dirname(__file__), "..", "drone_model.pt")
+    model_path = os.path.join(os.path.dirname(__file__), "..", "drone_model_v2.pt")
     checkpoint = torch.load(model_path, map_location=device)
     policy.load_state_dict(checkpoint["policy"])
     policy.eval()
@@ -137,6 +138,14 @@ def main():
         drone_point.translate(delta, inplace=True)
         prev_pos[0] = new_pos
         step_index[0] += 1
+
+        # Translate both camera position and focal point by the drone's movement
+        # delta. The drone stays centred in the view, but the user's current
+        # orbit angle and zoom distance are preserved between steps.
+        if FOLLOW:
+            plotter.camera.position = (np.array(plotter.camera.position) + delta).tolist()
+            plotter.camera.focal_point = (np.array(plotter.camera.focal_point) + delta).tolist()
+
         plotter.render()
 
     # duration=100ms between steps — lower = faster playback

@@ -57,7 +57,7 @@ def cast_all_rays(values, origin, directions, max_range, thickness=1):
         vals = values[xb, yb, zb]
 
         # --- stop rays that hit solid ---
-        hit = np.isin(vals, [1, 2])
+        hit = np.isin(vals, [1, 2, 3])
         distances[ib[hit]] = np.linalg.norm(xyz[ib[hit]] - origin, axis=1)  # record hit distance
         active[ib[hit]] = False
 

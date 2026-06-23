@@ -15,7 +15,15 @@ pv.global_theme.allow_empty_mesh = True
 
 seed = random.randint(0, 10000)
 
-x, y, z = 30, 30, 100
+def reseed(new_seed=None):
+    """Re-roll the terrain/tree RNG seed. Call this before generate_terrain()/
+    generate_trees() whenever you want a genuinely NEW map — without this,
+    seed never changes after module import, so every "regenerated" world
+    was actually bit-identical (same heights, same trees, same start/end)."""
+    global seed
+    seed = new_seed if new_seed is not None else random.randint(0, 10000)
+
+x, y, z = 100, 30, 100
 scale = 0.01
 values = np.zeros((x, y, z), dtype=np.uint8)        #smallest dtype so that takes least amount of memory - 0-255
 ground_level = np.zeros((x,y), dtype=np.uint16)     #bigger but still small, must hold ground levl values - 0-65535
@@ -244,7 +252,7 @@ def replace_within_clearance(cx, cy, cz, block_type, new_type, clearance=1):
 def generate_terrain():
     for i in range(x):
         for j in range(y):
-            terr_z = int(fractal_height(i, j))
+            terr_z = int(fractal_height(i, j, seed=seed))
             ground_level[i][j] = terr_z
             
             for k in range(terr_z + 1):
@@ -274,18 +282,24 @@ def spawn_tree(tx, ty, tz, tree_height, tree_chance, tile_num):
         for i in range(1, tree_height + 1):
             values[tx][ty][tz + i] = 2
 
-def show_path(path_history):
+def show_path(path_history, grid_snapshot=None):
+    # use a provided snapshot if available, otherwise fall back to the live grid
+    # (live grid is usually dirty with lidar 8-markers and drone 5-markers from training)
+    display_values = grid_snapshot if grid_snapshot is not None else values
+
     grid = pv.ImageData()
-    grid.dimensions = np.array(values.shape) + 1
+    grid.dimensions = np.array(display_values.shape) + 1
     grid.spacing = (1, 1, 1)
     grid.origin = (0, 0, 0)
-    grid.cell_data["values"] = values.flatten(order="F")
+    grid.cell_data["values"] = display_values.flatten(order="F")
 
     plotter = pv.Plotter()
     plotter.set_background([30, 30, 40])
-    plotter.add_mesh(grid.threshold([0.5, 1.5], scalars="values"), color='#e07a5f')
-    plotter.add_mesh(grid.threshold([1.5, 2.5], scalars="values"), color='#432818')
-    plotter.add_mesh(grid.threshold([3.5, 4.5], scalars="values"), color='#ff0000')
+    plotter.add_mesh(grid.threshold([0.5, 1.5], scalars="values"), color='#e07a5f', opacity=0.5)           # terrain
+    plotter.add_mesh(grid.threshold([1.5, 2.5], scalars="values"), color='#432818')           # trees
+    plotter.add_mesh(grid.threshold([2.5, 3.5], scalars="values"), color='#00b4d8', opacity=0.1)  # tree-line
+    plotter.add_mesh(grid.threshold([3.5, 4.5], scalars="values"), color='#ff0000')           # end block
+    plotter.add_mesh(grid.threshold([4.5, 5.5], scalars="values"), color='#00d20e')           # start/drone
 
     if len(path_history) > 1:
         pts = np.array(path_history, dtype=np.float32)
@@ -310,7 +324,7 @@ def show_grid(drone=None):
 
     plotter = pv.Plotter()
     plotter.set_background([30, 30, 40])
-    plotter.add_mesh(terrain, show_edges=False, color='#e07a5f')
+    plotter.add_mesh(terrain, show_edges=False, color='#e07a5f', opacity=0.5)
     plotter.add_mesh(trees, show_edges=False, color='#432818')
     plotter.add_mesh(tree_line, show_edges=False, color='#00b4d8', opacity=0.1)
     plotter.add_mesh(end_block, show_edges=False, color='#ff0000')
@@ -354,4 +368,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
