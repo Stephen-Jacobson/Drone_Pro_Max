@@ -23,7 +23,13 @@ def reseed(new_seed=None):
     global seed
     seed = new_seed if new_seed is not None else random.randint(0, 10000)
 
-x, y, z = 100, 30, 100
+x, y, z = 500, 50, 100
+
+def set_dim(nx, ny, nz=100):
+    x = nx
+    y = ny
+    z = nz
+
 scale = 0.01
 values = np.zeros((x, y, z), dtype=np.uint8)        #smallest dtype so that takes least amount of memory - 0-255
 ground_level = np.zeros((x,y), dtype=np.uint16)     #bigger but still small, must hold ground levl values - 0-65535

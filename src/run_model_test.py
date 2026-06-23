@@ -18,7 +18,7 @@ from drone import Drone
 import pyvista as pv
 
 FOLLOW = True
-MAX_STEPS = 500
+MAX_STEPS = 600
 num_cells = 256
 
 # ── rebuild model architecture (must match rl_model.py exactly) ──────────────
@@ -80,7 +80,7 @@ def main():
     with torch.no_grad():
         policy(dummy)
 
-    model_path = os.path.join(os.path.dirname(__file__), "..", "pax_v1.pt")
+    model_path = os.path.join(os.path.dirname(__file__), "..", "pax_v1.1.pt")
     checkpoint = torch.load(model_path, map_location=device)
     policy.load_state_dict(checkpoint["policy"])
     policy.eval()

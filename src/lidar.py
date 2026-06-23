@@ -6,7 +6,7 @@ def mark_voxel(values, x, y, z, thickness=0):
     y0 = max(0, y - thickness);  y1 = min(values.shape[1], y + thickness + 1)
     z0 = max(0, z - thickness);  z1 = min(values.shape[2], z + thickness + 1)
     slab = values[x0:x1, y0:y1, z0:z1]
-    slab[~np.isin(slab, [1, 2, 4, 5])] = 8
+    slab[~np.isin(slab, [1, 2, 3, 4, 5])] = 8
 
 def get_goal_vector(drone_pos, goal_pos, max_range):
     diff     = goal_pos - drone_pos                          # (3,)

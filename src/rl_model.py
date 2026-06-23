@@ -27,6 +27,9 @@ from tqdm import tqdm
 
 import matplotlib.pyplot as plt
 
+import random
+import math
+
 from drone_env import DroneEnv
 import sim_env as sim
 # keep imports and constants at top as normal
@@ -35,8 +38,9 @@ from torch import nn
 from torch import multiprocessing
 # ... all imports ...
  
-MAX_STEPS = 500
+MAX_STEPS = 600
 VISUALISE = False
+CUR_STEP = 0
 
 if __name__ == "__main__":
     is_fork = multiprocessing.get_start_method() == "fork"
@@ -51,8 +55,8 @@ if __name__ == "__main__":
     
     print(f"training on {device}")
     
-    steps_per_batch = 2400          # how many moves will make before model learns from it, so model isnt updating until steps_per_batch moves have been done, 1 step = 1 move
-    total_steps = 500_000            # how many total steps until done training
+    steps_per_batch = 2000          # how many moves will make before model learns from it, so model isnt updating until steps_per_batch moves have been done, 1 step = 1 move
+    total_steps = 1_000_000            # how many total steps until done training
     #therefore if 1000 steps in batch and 50000 steps total, will learn 50000/1000 = 50 times
     
     # PPO Parameters (Proximal Policy Optimization)
@@ -71,6 +75,9 @@ if __name__ == "__main__":
     def build_world():
         """Generate a fresh terrain and return start, end, and a clean grid snapshot."""
         sim.reseed()
+        rx = math.floor(30 + (CUR_STEP/total_steps)*500)
+        ry = math.floor(30 + (CUR_STEP/total_steps)*150)
+        sim.set_dim(rx, ry)
         sim.values[:] = 0
         sim.ground_level[:] = 0
         sim.generate_terrain()
@@ -87,7 +94,7 @@ if __name__ == "__main__":
         v = clean_grid.copy()  # each env gets its own copy of the guaranteed-clean grid
         return DroneEnv(v, start, end)
 
-    base_env = ParallelEnv(24, make_env)
+    base_env = ParallelEnv(20, make_env)
     env = TransformedEnv(base_env, StepCounter(max_steps=MAX_STEPS))
     env = env.to(device)
     
@@ -185,6 +192,7 @@ if __name__ == "__main__":
     # Driving the iterator manually lets us actually swap it out after a regen.
     frames_collected = 0
     i = 0
+    CUR_STEP = i
     collector_iter = iter(collector)
 
     while frames_collected < total_steps:
@@ -195,6 +203,7 @@ if __name__ == "__main__":
 
         # regenerate terrain periodically so the model trains on varied worlds
         if i > 0 and i % REGEN_EVERY == 0:
+            
             start, end, clean_grid = build_world()
             # collector.shutdown() already closed base_env — don't call base_env.close()
             collector.shutdown()
@@ -271,11 +280,12 @@ if __name__ == "__main__":
 
         frames_collected += tensordict_data.numel()
         i += 1
+        CUR_STEP += 1
     
     torch.save({
         "policy": policy_module.state_dict(),
         "value":  value_module.state_dict(),
-    }, "drone_model_v2.pt")
+    }, "pax_v1.1.pt")
     print("model saved")
 
     plt.figure(figsize=(10, 10))

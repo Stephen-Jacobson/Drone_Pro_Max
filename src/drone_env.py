@@ -44,7 +44,7 @@ class DroneEnv(EnvBase):
             self.path_history.append(self.drone.pos.copy())
 
         obs = self._get_obs()
-        reward = self._get_reward(prev_pos)
+        reward = self._get_reward(prev_pos, current_step=self.current_step)
         done = self._is_done()
 
         return TensorDict(
@@ -75,7 +75,7 @@ class DroneEnv(EnvBase):
         direction, distance = lidar.get_goal_vector(self.drone.pos, self.end, self.sight_range)
         return np.concatenate([self._last_scan, direction, [distance]]).astype(np.float32)
 
-    def _get_reward(self, prev_pos, current_step=0, max_steps=500):
+    def _get_reward(self, prev_pos, current_step=0, max_steps=600):
         curr_dist = np.linalg.norm(self.drone.pos - self.end)
         prev_dist = np.linalg.norm(prev_pos - self.end)
     
@@ -94,8 +94,11 @@ class DroneEnv(EnvBase):
             reward = 0.5 * float(np.clip(progress, -1.0, 1.0))
     
         reward -= 0.01
+        # hazard-only shaping: penalize being dangerously close, never reward open air
+        SAFE_CLEARANCE = 0.3
         clearance = float(np.min(self._last_scan))
-        reward += 0.01 * clearance
+        if clearance < SAFE_CLEARANCE:
+            reward -= 0.02 * (SAFE_CLEARANCE - clearance)
     
         return float(np.clip(reward, -1.0, 1.0))
 
