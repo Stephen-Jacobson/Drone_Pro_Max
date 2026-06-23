@@ -25,6 +25,8 @@ from tensordict.nn.distributions import NormalParamExtractor
 
 from tqdm import tqdm
 
+import matplotlib.pyplot as plt
+
 from drone_env import DroneEnv
 import sim_env as sim
 # keep imports and constants at top as normal
@@ -32,6 +34,8 @@ import torch
 from torch import nn
 from torch import multiprocessing
 # ... all imports ...
+ 
+MAX_STEPS = 500
 
 if __name__ == "__main__":
     is_fork = multiprocessing.get_start_method() == "fork"
@@ -40,14 +44,14 @@ if __name__ == "__main__":
         if torch.cuda.is_available() and not is_fork
         else torch.device("cpu")
     )                               # decides if torch will go on gpu or cpu, gpu better
-    num_cells = 256                 # cells per hidden layer
+    num_cells = 256                  # cells per hidden layer
     lr = 3e-4
     max_grad_norm = 1.0             # prevents too violent actions early in training
     
     print(f"training on {device}")
     
-    steps_per_batch = 800          # how many moves will make before model learns from it, so model isnt updating until steps_per_batch moves have been done, 1 step = 1 move
-    total_steps = 50_000            # how many total steps until done training
+    steps_per_batch = 2400          # how many moves will make before model learns from it, so model isnt updating until steps_per_batch moves have been done, 1 step = 1 move
+    total_steps = 500_000            # how many total steps until done training
     #therefore if 1000 steps in batch and 50000 steps total, will learn 50000/1000 = 50 times
     
     # PPO Parameters (Proximal Policy Optimization)
@@ -56,12 +60,12 @@ if __name__ == "__main__":
         # and if done or hit object) from the 1000 which just occured, and will do that until steps_per_batch=1000 random values have been taken. 
         # Will do that num_epoch number of times, eg 10, therefore will have (1000/64)*10 = ~156 gradient updates. At each epoch gradient/model 
         # updates ~15 times, so model updates every 64 taken from 1000, ie ~156
-    sub_batch_size = 64
+    sub_batch_size = 256
     num_epochs = 10
     clip_epsilon = 0.2              # stops policy from updating too much in one steps, 0.2 will stop from updating when change is more than 20%
     gamma = 0.99                    # between 0-1, closer to 1, worries more about future rewards, closer to 0, worries more about immediate rewards
     lmbda = 0.95                    # used to compute advantage of move, ie was it better or worse than the expaected reward which our critic calculates
-    entropy_eps = 1e-4              # rewards exploration at beginning of training so model doesnt commit to badd moves, less important later in training
+    entropy_eps = 0.01              # rewards exploration at beginning of training so model doesnt commit to badd moves, less important later in training
     
     # generate the environment
     sim.generate_terrain()
@@ -76,8 +80,8 @@ if __name__ == "__main__":
         v = sim.values.copy()  # each env needs its own grid
         return DroneEnv(v, start, end)
     
-    base_env = ParallelEnv(8, make_env)  # 4 envs at once
-    env = TransformedEnv(base_env, StepCounter(max_steps=200))
+    base_env = ParallelEnv(24, make_env)  # 16 envs at once
+    env = TransformedEnv(base_env, StepCounter(max_steps=MAX_STEPS))
     env = env.to(device)
     
     actor_net = nn.Sequential(
@@ -148,7 +152,7 @@ if __name__ == "__main__":
         actor_network=policy_module,
         critic_network=value_module,
         clip_epsilon=clip_epsilon,
-        entropy_bonus=bool(entropy_eps),
+        entropy_bonus=True,
         entropy_coeff=entropy_eps,
         # these keys match by default but we set this for completeness
         critic_coeff=1.0,
@@ -172,7 +176,7 @@ if __name__ == "__main__":
             base_env.path_history = []
             base_env.record = True
             with set_exploration_type(ExplorationType.DETERMINISTIC), torch.no_grad():
-                env.rollout(200, policy_module)
+                env.rollout(MAX_STEPS, policy_module)
             base_env.record = False
             # path_copy = base_env.path_history.copy()
             # threading.Thread(target=sim.show_path, args=(path_copy,), daemon=True).start()
@@ -223,3 +227,18 @@ if __name__ == "__main__":
         "value":  value_module.state_dict(),
     }, "drone_model.pt")
     print("model saved")
+
+    plt.figure(figsize=(10, 10))
+    plt.subplot(2, 2, 1)
+    plt.plot(logs["reward"])
+    plt.title("training rewards (average)")
+    plt.subplot(2, 2, 2)
+    plt.plot(logs["step_count"])
+    plt.title("Max step count (training)")
+    plt.subplot(2, 2, 3)
+    plt.plot(logs["eval reward (sum)"])
+    plt.title("Return (test)")
+    plt.subplot(2, 2, 4)
+    plt.plot(logs["eval step_count"])
+    plt.title("Max step count (test)")
+    plt.show()

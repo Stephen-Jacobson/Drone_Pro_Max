@@ -1,3 +1,7 @@
+import os                                       # have to do this so it works for me, idk why, delete if it messes with things
+os.environ["__NV_PRIME_RENDER_OFFLOAD"] = "1"
+os.environ["__GLX_VENDOR_LIBRARY_NAME"] = "nvidia"
+
 import pyvista as pv
 import numpy as np
 from noise import pnoise2
@@ -11,7 +15,7 @@ pv.global_theme.allow_empty_mesh = True
 
 seed = random.randint(0, 10000)
 
-x, y, z = 100, 100, 100
+x, y, z = 30, 30, 100
 scale = 0.01
 values = np.zeros((x, y, z), dtype=np.uint8)        #smallest dtype so that takes least amount of memory - 0-255
 ground_level = np.zeros((x,y), dtype=np.uint16)     #bigger but still small, must hold ground levl values - 0-65535
@@ -54,63 +58,50 @@ def fractal_height(x, y, seed=seed, scale=scale, octaves=5, persistence=0.01, am
 # TODO generate random start and end points on map
 
 def generate_start_and_end():
-    edge_band = max(1, int(min(x, y) * 0.2))
-    minimum_span = int(min(x, y) * 0.6)
-
-    def _tree_clear(cx, cy, cz, clearance=1):
-        x_min = max(0, cx - clearance)
-        x_max = min(x - 1, cx + clearance)
-        y_min = max(0, cy - clearance)
-        y_max = min(y - 1, cy + clearance)
-        z_min = max(0, cz - clearance)
-        z_max = min(z - 1, cz + clearance)
-        for nx in range(x_min, x_max + 1):
-            for ny in range(y_min, y_max + 1):
-                for nz in range(z_min, z_max + 1):
-                    if values[nx][ny][nz] == 2:
-                        return False
-        return True
-
-    def _collect_points(x_range, y_range):
-        points = []
-        for cx in x_range:
-            for cy in y_range:
-                z_levels = valid_z_values(cx, cy)
-                if z_levels:
-                    points.append((cx, cy, random.choice(z_levels)))
-        return points
-
-    left_points = _collect_points(range(0, edge_band), range(0, y))
-    right_points = _collect_points(range(x - edge_band, x), range(0, y))
-    bottom_points = _collect_points(range(0, x), range(0, edge_band))
-    top_points = _collect_points(range(0, x), range(y - edge_band, y))
-
-    pair_options = [
-        (left_points, right_points),
-        (bottom_points, top_points),
-    ]
-    random.shuffle(pair_options)
-
-    for side_a, side_b in pair_options:
-        if not side_a or not side_b:
+    min_distance = max(x, y) / 2.0
+ 
+    # Build a flat list of all valid candidate positions across the whole grid
+    all_candidates = []
+    for cx in range(x):
+        for cy in range(y):
+            z_levels = valid_z_values(cx, cy)
+            if z_levels:
+                all_candidates.append((cx, cy))
+ 
+    if len(all_candidates) < 2:
+        raise RuntimeError("Not enough valid grid positions to place start and end")
+ 
+    random.shuffle(all_candidates)
+ 
+    # Pick a random start, then find any end that satisfies min_distance
+    # Shuffle candidates so both start and end positions are unpredictable
+    for i, (sx, sy) in enumerate(all_candidates):
+        sz = random.choice(valid_z_values(sx, sy))
+        start = (sx, sy, sz)
+ 
+        # Collect all candidates far enough away and pick one at random
+        far_enough = [
+            (cx, cy) for cx, cy in all_candidates
+            if ((cx - sx) ** 2 + (cy - sy) ** 2) ** 0.5 >= min_distance
+        ]
+ 
+        if not far_enough:
             continue
-
-        start = random.choice(side_a)
-        end = max(
-            side_b,
-            key=lambda p: (p[0] - start[0]) ** 2 + (p[1] - start[1]) ** 2,
-        )
-
-        span = ((start[0] - end[0]) ** 2 + (start[1] - end[1]) ** 2) ** 0.5
-        if span >= minimum_span:
-            # Mark positions in grid: 5 for drone/start, 4 for end
-            values[start[0]][start[1]][start[2]] = 5
-            values[end[0]][end[1]][end[2]] = 4
-            return start, end
-
+ 
+        ex, ey = random.choice(far_enough)
+        ez = random.choice(valid_z_values(ex, ey))
+        end = (ex, ey, ez)
+ 
+        # Mark positions in grid: 5 for drone/start, 4 for end
+        values[start[0]][start[1]][start[2]] = 5
+        values[end[0]][end[1]][end[2]] = 4
+        return start, end
+ 
+    raise RuntimeError("Could not find a valid start/end pair meeting the minimum distance")
+ 
 def valid_z_values(cx, cy):
     valid_levels = list(range(ground_level[cx][cy] + 1, ground_level[cx][cy] + tree_line_height + tree_line_recede))       #valid range of z values based on what will be open
-
+ 
     return valid_levels
     
 def generate_points(
