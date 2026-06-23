@@ -29,7 +29,7 @@ class Drone(object):
             return True
 
         nx, ny, nz = int(new_pos[0]), int(new_pos[1]), int(new_pos[2])
-        hit = self.values[nx, ny, nz] in [1, 2]   # terrain or tree
+        hit = self.values[nx, ny, nz] in [1, 2, 3]   # terrain or tree or tree line
 
         if hit:
             # don't fly through solid terrain/trees — stay put, signal the collision.
