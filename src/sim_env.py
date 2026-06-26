@@ -23,7 +23,7 @@ def reseed(new_seed=None):
     global seed
     seed = new_seed if new_seed is not None else random.randint(0, 10000)
 
-x, y, z = 500, 50, 100
+x, y, z = 300, 50, 100
 
 def set_dim(nx, ny, nz=100):
     x = nx

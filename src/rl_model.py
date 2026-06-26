@@ -40,7 +40,6 @@ from torch import multiprocessing
  
 MAX_STEPS = 600
 VISUALISE = False
-CUR_STEP = 0
 
 if __name__ == "__main__":
     is_fork = multiprocessing.get_start_method() == "fork"
@@ -55,7 +54,7 @@ if __name__ == "__main__":
     
     print(f"training on {device}")
     
-    steps_per_batch = 2000          # how many moves will make before model learns from it, so model isnt updating until steps_per_batch moves have been done, 1 step = 1 move
+    steps_per_batch = 8000          # how many moves will make before model learns from it, so model isnt updating until steps_per_batch moves have been done, 1 step = 1 move
     total_steps = 1_000_000            # how many total steps until done training
     #therefore if 1000 steps in batch and 50000 steps total, will learn 50000/1000 = 50 times
     
@@ -65,18 +64,20 @@ if __name__ == "__main__":
         # and if done or hit object) from the 1000 which just occured, and will do that until steps_per_batch=1000 random values have been taken. 
         # Will do that num_epoch number of times, eg 10, therefore will have (1000/64)*10 = ~156 gradient updates. At each epoch gradient/model 
         # updates ~15 times, so model updates every 64 taken from 1000, ie ~156
-    sub_batch_size = 256
-    num_epochs = 15
+    sub_batch_size = 512
+    num_epochs = 10
     clip_epsilon = 0.2              # stops policy from updating too much in one steps, 0.2 will stop from updating when change is more than 20%
     gamma = 0.95                    # between 0-1, closer to 1, worries more about future rewards, closer to 0, worries more about immediate rewards
     lmbda = 0.95                    # used to compute advantage of move, ie was it better or worse than the expaected reward which our critic calculates
     entropy_eps = 0.01              # rewards exploration at beginning of training so model doesnt commit to badd moves, less important later in training
+    frames_collected = 0 
     
     def build_world():
         """Generate a fresh terrain and return start, end, and a clean grid snapshot."""
         sim.reseed()
-        rx = math.floor(30 + (CUR_STEP/total_steps)*500)
-        ry = math.floor(30 + (CUR_STEP/total_steps)*150)
+        progress = frames_collected / total_steps
+        rx = math.floor(30 + progress * 500)
+        ry = math.floor(30 + progress * 150)
         sim.set_dim(rx, ry)
         sim.values[:] = 0
         sim.ground_level[:] = 0
@@ -182,7 +183,7 @@ if __name__ == "__main__":
     pbar = tqdm(total=total_steps)
     eval_str = ""
     
-    REGEN_EVERY = 10  # new world every N batches (~104 batches total)
+    REGEN_EVERY = 3  # new world every N batches (~104 batches total)
 
     # `for i, x in enumerate(collector)` would only call iter(collector) ONCE, up front.
     # Reassigning the `collector` variable inside the loop body (on regen) does NOT change
@@ -190,9 +191,7 @@ if __name__ == "__main__":
     # now-shutdown() collector, whose internal `_final_rollout` has been torn down. That's
     # the source of `AttributeError: 'Collector' object has no attribute '_final_rollout'`.
     # Driving the iterator manually lets us actually swap it out after a regen.
-    frames_collected = 0
     i = 0
-    CUR_STEP = i
     collector_iter = iter(collector)
 
     while frames_collected < total_steps:
@@ -280,7 +279,6 @@ if __name__ == "__main__":
 
         frames_collected += tensordict_data.numel()
         i += 1
-        CUR_STEP += 1
     
     torch.save({
         "policy": policy_module.state_dict(),

@@ -82,25 +82,27 @@ class DroneEnv(EnvBase):
         if self._hit_something():
             return -1.0
         if curr_dist < GOAL_RADIUS:
-            time_bonus = 5.0 * (1 - current_step / max_steps)  # 5.0 early, decays to 0.0 late
-            return float(np.clip(time_bonus, 1.0, 5.0))         # always at least 1.0 for reaching goal
+            # time_bonus = 10.0 * (1 - current_step / max_steps)  # 10.0 early, decays to 0.0 late
+            # return float(np.clip(time_bonus, 5.0, 10.0))         # always at least 5.0 for reaching goal
+            return 1
+        return -0.01
     
-        max_step = float(np.sqrt(3))
-        progress = (prev_dist - curr_dist) / max_step
+        # max_step = float(np.sqrt(3))
+        # progress = (prev_dist - curr_dist) / max_step
     
-        if progress <= 0:
-            reward = 1.5 * float(np.clip(progress, -1.0, 1.0))
-        else:
-            reward = 0.5 * float(np.clip(progress, -1.0, 1.0))
+        # if progress <= 0:
+        #     reward = 1.5 * float(np.clip(progress, -1.0, 1.0))
+        # else:
+        #     reward = 0.5 * float(np.clip(progress, -1.0, 1.0))
     
-        reward -= 0.01
+        # reward -= 0.01
         # hazard-only shaping: penalize being dangerously close, never reward open air
-        SAFE_CLEARANCE = 0.3
-        clearance = float(np.min(self._last_scan))
-        if clearance < SAFE_CLEARANCE:
-            reward -= 0.02 * (SAFE_CLEARANCE - clearance)
+        # SAFE_CLEARANCE = 0.3
+        # clearance = float(np.min(self._last_scan))
+        # if clearance < SAFE_CLEARANCE:
+        #     reward -= 0.02 * (SAFE_CLEARANCE - clearance)
     
-        return float(np.clip(reward, -1.0, 1.0))
+        # return float(np.clip(reward, -1.0, 1.0))
 
     def _hit_something(self):
         # authoritative — set directly from Drone.move()'s return value in _step().

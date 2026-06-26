@@ -71,6 +71,15 @@ wheels = [
 ]
 
 [[package]]
+name = "colorama"
+version = "0.4.6"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/d8/53/6f443c9a4a8358a93a6792e2acffb9d9d5cb0a5cfd8802644b7b1c9a02e4/colorama-0.4.6.tar.gz", hash = "sha256:08695f5cb7ed6e0531a20572697297273c47b8cae5a63ffc6d6ed5c201be6e44", size = 27697, upload-time = "2022-10-25T02:36:22.414Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/d1/d6/3965ed04c63042e047cb6a3e6ed1a63a35087b6a609aa3a15ed8ac56c221/colorama-0.4.6-py2.py3-none-any.whl", hash = "sha256:4f1d9991f5acc0ca119f9d443620b77f9d6b33703e51011c16baf57afb285fc6", size = 25335, upload-time = "2022-10-25T02:36:20.889Z" },
+]
+
+[[package]]
 name = "contourpy"
 version = "1.3.3"
 source = { registry = "https://pypi.org/simple" }
@@ -214,6 +223,7 @@ dependencies = [
     { name = "stable-baselines3" },
     { name = "torch" },
     { name = "torchrl" },
+    { name = "tqdm" },
 ]
 
 [package.metadata]
@@ -229,6 +239,7 @@ requires-dist = [
     { name = "stable-baselines3", specifier = ">=2.8.0" },
     { name = "torch", specifier = ">=2.11.0" },
     { name = "torchrl", specifier = ">=0.13.2" },
+    { name = "tqdm", specifier = ">=4.68.3" },
 ]
 
 [[package]]
@@ -1206,6 +1217,18 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/a9/96/58f886085cc611db10cfc925e3167afce0850475bbe29ac42e81c2842157/torchrl-0.13.2-cp314-cp314-manylinux_2_28_aarch64.whl", hash = "sha256:f6ad51b750bcfd180c02fd19371ca56a5101459c6ab6fbee933c094cc693cc1a", size = 2519259, upload-time = "2026-06-16T21:09:19.707Z" },
     { url = "https://files.pythonhosted.org/packages/da/37/c009f92ea1275bc157c22c5bfaeb973400a5df48c02e2a28cb376ea05c88/torchrl-0.13.2-cp314-cp314-manylinux_2_28_x86_64.whl", hash = "sha256:a4a970c86984f04fe5cffeb3f0dff16bf86415e4c67b8ad85821b5d899c4abbe", size = 2533194, upload-time = "2026-06-16T21:09:21.453Z" },
     { url = "https://files.pythonhosted.org/packages/e4/5d/5fa915d8c83d5ccf4c2669b9d7964e8c916421e03741edcf02fcd8e5b374/torchrl-0.13.2-cp314-cp314-win_amd64.whl", hash = "sha256:30b5bcb6310dc8b7e993d21a061f1a82c7e8473b84917b2fa65e774d3c0dd95a", size = 2506828, upload-time = "2026-06-16T21:09:23.132Z" },
+]
+
+[[package]]
+name = "tqdm"
+version = "4.68.3"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "colorama", marker = "sys_platform == 'win32'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/87/d7/0535a28b1f5f24f6612fb3ff1e89fb1a8d160fee0f976e0aa6803862134b/tqdm-4.68.3.tar.gz", hash = "sha256:00dfa48452b6b6cfae3dd9885636c23d3422d1ec97c66d96818cbd5e0821d482", size = 170596, upload-time = "2026-06-17T07:36:52.105Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/d8/8e/bb97bb0c71802080bfc8952937d174e49cfc50de5c951dd47b2496f0dcdb/tqdm-4.68.3-py3-none-any.whl", hash = "sha256:39832cc2def2789a6f29df83f172db7416cea70052c0907a57801c5f2fdccb03", size = 78337, upload-time = "2026-06-17T07:36:50.132Z" },
 ]
 
 [[package]]
