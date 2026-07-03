@@ -2,6 +2,9 @@ import os                                       # have to do this so it works fo
 os.environ["__NV_PRIME_RENDER_OFFLOAD"] = "1"
 os.environ["__GLX_VENDOR_LIBRARY_NAME"] = "nvidia"
 
+# First two lines check waht they do, stephs computer doesnt run this shit without it ??
+# Telling your PC what the environment is 
+
 import pyvista as pv
 import numpy as np
 from noise import pnoise2
@@ -10,6 +13,7 @@ from scipy.interpolate import CubicSpline
 from skimage.draw import line
 
 from drone import Drone
+import cave_gen
 
 pv.global_theme.allow_empty_mesh = True
 
@@ -37,6 +41,9 @@ ground_level = np.zeros((x,y), dtype=np.uint16)     #bigger but still small, mus
 tree_line_height = 15
 tree_line_recede = 0
 tree_density = 0.01
+# Ion evven know what the rigt value is supposed to be here tbh 
+cave_density = 0.015
+cave_room_size = 1.5
 
 # gets height per x y spot on grid to give a bumpy terrain, from gpt, for bumpier, increase octaves, persistence, amplitude, for less bumpy, decrease octaves, persistence eg 0.3, lower scale
 # Scale: up - denser bumps, down - wide smooth hills
@@ -242,10 +249,8 @@ def replace_within_clearance(cx, cy, cz, block_type, new_type, clearance=1):
 
 # TODO generate random points until end, maybe with changable varyation
 # like can be a very winding path or points are more in a line shape, then connect points using cubic splines which will create smooth path
-
+#
 # def generate_random_path():
-
-
 # uses number 1 as block indicator for terrain 
 # uses number 2 as block indicator for trees 
 # uses number 3 as block indicator for tree line
@@ -256,6 +261,7 @@ def replace_within_clearance(cx, cy, cz, block_type, new_type, clearance=1):
 # uses number 8 as block indicator for drone surroundings
 # added tree line so could stop pathfinder from going above trees 
 def generate_terrain():
+
     for i in range(x):
         for j in range(y):
             terr_z = int(fractal_height(i, j, seed=seed))
@@ -271,6 +277,9 @@ def generate_terrain():
                 if values[i][j][terr_z + k] == 0 and terr_z + k > recede:
                         
                     values[i][j][terr_z + k] = 3
+
+    #NOTE: cave_gen entry point 
+    cave_gen.gen_caves(values, ground_level, seed, density=cave_density, room_size=cave_room_size)
 
 def generate_trees(tree_chance=tree_density, tree_height=15, gen_trees=True):
     if gen_trees:

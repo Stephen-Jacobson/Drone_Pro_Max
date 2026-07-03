@@ -95,6 +95,8 @@ if __name__ == "__main__":
         v = clean_grid.copy()  # each env gets its own copy of the guaranteed-clean grid
         return DroneEnv(v, start, end)
 
+    # this will run 20 environments: based on the number of cores that works 
+    # the more the better 
     base_env = ParallelEnv(20, make_env)
     env = TransformedEnv(base_env, StepCounter(max_steps=MAX_STEPS))
     env = env.to(device)
