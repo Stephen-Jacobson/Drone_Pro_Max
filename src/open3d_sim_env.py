@@ -9,6 +9,7 @@ import random
 import time
 from skimage.measure import marching_cubes
 from drone import Drone
+from spray_tracker import SprayTracker
 
 max_x, max_y = 30, 30
 
@@ -21,7 +22,7 @@ max_x, max_y = 30, 30
 # broken and why there was barely any solid rock left for the worms to dig
 # into. Fixed by splitting these into separate, clearly-named constants:
 
-GRID_DEPTH = 64        # vertical resolution of the voxel grid (world height in voxels)
+GRID_DEPTH = 40        # vertical resolution of the voxel grid (world height in voxels)
 BASE_HEIGHT = 28        # guaranteed-solid floor thickness -> raise this for more underground room to carve caves in
 HEIGHT_VARIATION = 4   # how tall the hills get ABOVE the base (raise this for more dramatic peaks)
 
@@ -45,11 +46,11 @@ def generate_height_perlin(scale, octaves, persistence, lacunarity, seed):
 
 def spawn_drone(voxels, height_above=1, x=None, y=None, color=None):
     if x is None:
-        start_x = random.randint(0, max_x)
+        start_x = random.randint(0, max_x-1)
     else:
         start_x = x
     if y is None:
-        start_y = random.randint(0, max_y)
+        start_y = random.randint(0, max_y-1)
     else:
         start_y = y
 
@@ -255,7 +256,46 @@ def fill_regions_top_materials(voxels, labels, region_materials=None, depth=1, p
             # leaving everything below untouched.
             voxels[x, y, z0:surface_idx + 1] = material_id
 
-    return voxels
+    return voxels, region_materials
+
+
+def water_region_prob(progress, start_prob=0.05, end_prob=0.8, ramp_frac=0.6):
+    """Curriculum for how much of the terrain needs watering (material 4).
+
+    `progress` is training progress in [0, 1] (e.g. frames_collected / total_steps).
+    Ramps linearly from `start_prob` up to `end_prob` over the first `ramp_frac`
+    of training, then holds steady at `end_prob` for the rest.
+
+    Early on, few regions need water -> easy for a fresh drone. By the time
+    `ramp_frac` of training has elapsed, up to `end_prob` fraction of regions
+    need water and it stays there.
+    """
+    progress = min(max(progress, 0.0), 1.0)
+    if ramp_frac <= 0:
+        return end_prob
+    t = min(progress / ramp_frac, 1.0)
+    return start_prob + t * (end_prob - start_prob)
+
+
+def generate_voxels_with_regions(prob4=0.8, path_material=3, region_depth=1, **voxel_kwargs):
+    """One-call terrain generator that also labels crop-plot regions and
+    paints them with water-need materials (4 = needs water, 5 = doesn't).
+
+    NOTE: not used by rl_model.py's training loop -- DroneEnv re-labels and
+    re-fills regions itself from scratch on every __init__/_reset (see
+    drone_env.py), so any regions baked in here would just get overwritten.
+    This is kept as a standalone convenience for scripts (e.g. run_simulation,
+    or ad-hoc testing) that want terrain + regions in a single call without
+    going through DroneEnv. `**voxel_kwargs` are forwarded to generate_voxels
+    (scale, octaves, etc). For the training curriculum, use water_region_prob()
+    and pass its result as `prob4=` to DroneEnv directly instead.
+    """
+    voxels = generate_voxels(**voxel_kwargs)
+    labels, _count = label_path_regions(voxels, path_material=path_material)
+    voxels, region_materials = fill_regions_top_materials(
+        voxels, labels, depth=region_depth, prob4=prob4
+    )
+    return voxels, region_materials
 
 
 def mesh_from_voxels(voxels):
@@ -461,6 +501,40 @@ def apply_perlin_worms(voxels, z_grid, num_worms=6, worm_length=250, radius=1.6,
     return voxels
 
 
+def make_spray_lineset(origin, hit_xyz, color=(0.0, 1.0, 0.0)):
+    """Build a LineSet of bright green segments from the drone's spray
+    origin out to each ground point its spray rays hit, so the water spray
+    is visible in the viewer instead of being invisible/instant.
+
+    `origin` is the drone's float (x, y, z) position; `hit_xyz` is the
+    (K, 3) array returned by Drone.spray() / lidar.cast_spray_rays(). If
+    there are no hits this frame, returns an empty (but valid) LineSet.
+    """
+    origin = np.asarray(origin, dtype=np.float64) + 0.5  # match voxel-center offset
+    hit_xyz = np.asarray(hit_xyz, dtype=np.float64)
+
+    line_set = o3d.geometry.LineSet()
+    if hit_xyz.size == 0:
+        line_set.points = o3d.utility.Vector3dVector(np.zeros((0, 3)))
+        line_set.lines = o3d.utility.Vector2iVector(np.zeros((0, 2), dtype=np.int32))
+        line_set.colors = o3d.utility.Vector3dVector(np.zeros((0, 3)))
+        return line_set
+
+    hit_points = hit_xyz + 0.5  # match voxel-center offset used elsewhere
+    n = len(hit_points)
+
+    # point 0 = drone origin, points 1..n = each hit; one line per hit
+    # connecting it back to the origin.
+    points = np.vstack([origin[None, :], hit_points])
+    lines = np.column_stack([np.zeros(n, dtype=np.int32), np.arange(1, n + 1, dtype=np.int32)])
+    colors = np.tile(color, (n, 1))  # bright green for every segment
+
+    line_set.points = o3d.utility.Vector3dVector(points)
+    line_set.lines = o3d.utility.Vector2iVector(lines)
+    line_set.colors = o3d.utility.Vector3dVector(colors)
+    return line_set
+
+
 def make_drone_mesh(drone, radius=0.4):
     """Build a small sphere mesh for the drone, colored from drone.get_color()
     and centered on the drone's true float position (+0.5 to match the same
@@ -477,7 +551,11 @@ def run_simulation():
 
     voxels = generate_voxels()
     labels, count = label_path_regions(voxels, path_material=3)
-    fill_regions_top_materials(voxels, labels, prob4=0.8)
+    voxels, region_materials = fill_regions_top_materials(voxels, labels, prob4=0.8)
+
+
+    n_spray_rays = 50
+    spray_tracker = SprayTracker(voxels, labels, region_materials, n_spray_rays)
 
     # Spawn drone with custom color — this now actually shows up, since the
     # drone is its own mesh instead of a voxel material ID.
@@ -494,6 +572,10 @@ def run_simulation():
 
     drone_mesh = make_drone_mesh(drone)
 
+    # Empty placeholder to start -- filled in with real spray-ray segments
+    # every time the drone sprays (see animation_callback below).
+    spray_lineset = make_spray_lineset(drone.get_position(), np.zeros((0, 3)))
+
     print(f"Visualizing terrain as '{SHOW_AS}' with drone movement...")
     vis = o3d.visualization.VisualizerWithKeyCallback()
     vis.create_window(window_name="Open3D Terrain Visualization", width=1024, height=768)
@@ -501,6 +583,11 @@ def run_simulation():
     for geom in terrain_geoms:
         vis.add_geometry(geom)
     vis.add_geometry(drone_mesh)
+    vis.add_geometry(spray_lineset)
+
+    # Line width is honored on some backends/platforms and ignored on others
+    # (a known Open3D legacy-renderer limitation); harmless to set regardless.
+    vis.get_render_option().line_width = 4.0
 
     state = {
         "paused": False,
@@ -521,7 +608,7 @@ def run_simulation():
     vis.register_key_callback(ord(" "), toggle_pause)
 
     move_interval = 0.3  # seconds between drone moves
-    max_moves = 20
+    max_moves = 200
 
     def animation_callback(vis_):
         if state["paused"] or state["move_count"] >= max_moves:
@@ -542,7 +629,23 @@ def run_simulation():
         state["last_drone_pos"] = new_pos.copy()
         vis_.update_geometry(drone_mesh)
 
-        print(f"Move {state['move_count']}/{max_moves}: drone at {new_pos}")
+        # Fire the spray cone from wherever the drone ended up and record
+        # which ground cells it hit. No reward logic here -- just tracking.
+        hits = drone.spray(n_rays=n_spray_rays)
+        spray_tracker.register_hits(hits)
+
+        # Redraw the spray as bright green lines from the drone down to
+        # each ground point it hit this frame. update_geometry() needs the
+        # same LineSet object mutated in place, not a fresh one swapped in.
+        fresh_lineset = make_spray_lineset(new_pos, hits)
+        spray_lineset.points = fresh_lineset.points
+        spray_lineset.lines = fresh_lineset.lines
+        spray_lineset.colors = fresh_lineset.colors
+        vis_.update_geometry(spray_lineset)
+
+        print(f"Move {state['move_count']}/{max_moves}: drone at {new_pos}, "
+              f"spray hits: {len(hits)}, "
+              f"needs-water completeness: {spray_tracker.needs_water_completeness()}")
         return True  # tells Open3D a redraw is needed
 
     vis.register_animation_callback(animation_callback)

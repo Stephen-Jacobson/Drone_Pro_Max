@@ -16,7 +16,13 @@ class Drone(object):
         self.values = values
         self.color = color if color is not None else np.array([1.0, 0.0, 0.0])  # default red
 
-    def move(self, direction, amount=1.0):
+        # Spray/watering settings -- separate from lidar sight_range since
+        # the spray cone is a different sensor/actuator with its own tunable
+        # ray count and spread angle.
+        self.spray_n_rays = 200
+        self.spray_spread_deg = 15.0
+
+    def move(self, direction, amount=3.0):
         direction = np.array(direction, dtype=np.float32)
         amount = float(amount)  # ensure float movement amounts
         
@@ -95,6 +101,31 @@ class Drone(object):
 
     def set_sight_range(self, sight_range):
         self.sight_range = sight_range
+
+    def set_spray_params(self, n_rays=None, spread_deg=None):
+        """Change how many rays the spray cone fires and/or how wide it
+        opens. Leave either as None to keep its current value."""
+        if n_rays is not None:
+            self.spray_n_rays = int(n_rays)
+        if spread_deg is not None:
+            self.spray_spread_deg = float(spread_deg)
+
+    def spray(self, n_rays=None, spread_deg=None, max_range=None):
+        """Fire the spray cone straight down from the drone's current
+        position and return which ground voxels got hit.
+
+        n_rays / spread_deg override this drone's stored spray settings for
+        just this call, if given. This method only reports hits -- it does
+        not update any tracker or grid itself and computes no reward; hand
+        the returned array to something like SprayTracker.register_hits().
+
+        Returns:
+            (K, 3) int array of (x, y, z) voxel coords hit, K <= n_rays.
+        """
+        n_rays = self.spray_n_rays if n_rays is None else int(n_rays)
+        spread_deg = self.spray_spread_deg if spread_deg is None else float(spread_deg)
+        return lidar.cast_spray_rays(self.values, self.pos, n_rays=n_rays,
+                                      spread_deg=spread_deg, max_range=max_range)
 
     def get_obs(self):
         scan = lidar.get_lidar_surroundings(self.values, self.pos, self.sight_range)
