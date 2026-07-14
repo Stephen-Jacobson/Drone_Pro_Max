@@ -1,4 +1,5 @@
 import os
+
 os.environ["__NV_PRIME_RENDER_OFFLOAD"] = "1"
 os.environ["__GLX_VENDOR_LIBRARY_NAME"] = "nvidia"
 
@@ -15,13 +16,13 @@ from torchrl.data import Bounded
 import sim_env as sim
 from drone_env import DroneEnv
 from drone import Drone
-import pyvista as pv
 
 FOLLOW = True
 MAX_STEPS = 600
 num_cells = 256
 
 # ── rebuild model architecture (must match rl_model.py exactly) ──────────────
+
 
 def build_policy(obs_size, action_shape, device):
     actor_net = nn.Sequential(
@@ -98,11 +99,13 @@ def main():
             path_history.append(env.drone.pos.copy())
 
             done = td["done"].item()
-            hit  = env._hit_something()
+            hit = env._hit_something()
             dist = float(np.linalg.norm(env.drone.pos - np.array(end)))
 
             if step % 50 == 0:
-                print(f"  step {step:4d} | dist to goal: {dist:.2f} | hit: {hit} | done: {done}")
+                print(
+                    f"  step {step:4d} | dist to goal: {dist:.2f} | hit: {hit} | done: {done}"
+                )
 
             if done:
                 if hit:
@@ -122,35 +125,34 @@ def main():
 
     # create a temporary drone object positioned at start for show_grid
     vis_drone = Drone(0, 10, sim.values, start, end)
-    plotter, drone_point = sim.show_grid(vis_drone)
-    assert drone_point is not None
+    vis, drone_mesh = sim.show_grid(vis_drone)
+    assert drone_mesh is not None
 
     step_index = [0]
     prev_pos = [np.array(start, dtype=np.float32)]
 
-    def advance(_caller):
+    def advance(vis):
         i = step_index[0]
         if i >= len(path_history):
-            return
+            vis.close()
+            return True
 
         new_pos = path_history[i].astype(np.float32)
         delta = new_pos - prev_pos[0]
-        drone_point.translate(delta, inplace=True)
+        drone_mesh.translate(delta)
+        vis.update_geometry(drone_mesh)
         prev_pos[0] = new_pos
         step_index[0] += 1
 
-        # Translate both camera position and focal point by the drone's movement
-        # delta. The drone stays centred in the view, but the user's current
-        # orbit angle and zoom distance are preserved between steps.
         if FOLLOW:
-            plotter.camera.position = (np.array(plotter.camera.position) + delta).tolist()
-            plotter.camera.focal_point = (np.array(plotter.camera.focal_point) + delta).tolist()
+            ctrl = vis.get_view_control()
+            lookat = np.asarray(ctrl.get_lookat()) + delta
+            ctrl.set_lookat(lookat)
 
-        plotter.render()
+        return False
 
-    # duration=100ms between steps — lower = faster playback
-    plotter.add_timer_event(max_steps=len(path_history), duration=100, callback=advance)
-    plotter.show()
+    vis.register_animation_callback(advance)
+    vis.run()
 
 
 if __name__ == "__main__":

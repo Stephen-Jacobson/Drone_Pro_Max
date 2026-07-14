@@ -1,91 +1,112 @@
-import numpy as numpy
-from noise import pnoise3
-
-# returns a value between -1 and 1 as the fractal brownian noise 
-# representing the signed local density of the noise field at the exact point. It is interepreted as 
-# what the odds are that rock is air.  
-#   -> high value => carve 
-#   -> low values => leave solid 
-#
-# By using fractal brownian motion we create a multiscale pattern where large caverns (octave 1) are 
-# overlaid with medium tunnels (octave 2) and wall/roof roughness (octave 3+).
-# Final normalisation ensures the threshold comparison is scale-invariant 
-# as octives change (hence using a fractal ).
-#
-# @params : 
-#   * (x,y,z) = current coordinates
-#   * seed = offsets the noise field. 
-#            used by pnoise3 as a base arg to permute the permutation table
-#            [permutation table 0->255 mapping input coordinate to pseudo-random gradient, 
-#            read more about Perlin's original table for an ideea ]
-#   * octaves = No. layers of noise summed together
-#               Each octave doubles the frequency and muls the amplitude by the persistance
-#   * persistance = Rate amplitude decays per octave.  
-#                   Each amplitude is * by persistance
-#   * lacunarity = Rate frequency increases per wave.
-#                  Mulled by each octives freqwuency 
-#   * scale = base noise frequency controlling the wavelngth of the first octave
-#
-#   All current values were selected by AI, as such should be taken with a grain of salt.
-#   Experiment with changing the values to generate different systems 
-#   NOTE: 
-#   octaves controls the levels of detail i.e large/ caverns and tunnel sizes
-#   persistance means each octave contributes that fraction as the previous
-#   scale : 0.04 means the noise function sees coordinates divided by 1/0.04 = 25 ?? (0.01 = huge cathedral caverns)
+import numpy as np
+from subt_proc_gen.tunnel import (
+    TunnelNetwork,
+    TunnelNetworkParams,
+    GrownTunnelGenerationParams,
+    ConnectorTunnelGenerationParams,
+)
+from subt_proc_gen.param_classes import (
+    TunnelPtClGenParams,
+    IntersectionPtClGenParams,
+)
+import random
 
 
-def fractal_noise(x, y, z, seed, octaves = 4, persistance = 0.5, lacunarity = 2.0, scale = 0.04):
-    value = 0.0
-    amplitude = 1.0
-    max_amplitude = 0.0
-    frequency = 1.0 #higher frequency means smaller and more detailed 
+def carve_sphere(values, cx, cy, cz, radius, cave_val):
+    gx, gy, gz = values.shape
+    x0, x1 = max(0, int(cx - radius)), min(gx, int(cx + radius + 1))
+    y0, y1 = max(0, int(cy - radius)), min(gy, int(cy + radius + 1))
+    z0, z1 = max(0, int(cz - radius)), min(gz, int(cz + radius + 1))
+    for ix in range(x0, x1):
+        for iy in range(y0, y1):
+            for iz in range(z0, z1):
+                if (ix - cx) ** 2 + (iy - cy) ** 2 + (iz - cz) ** 2 <= radius**2:
+                    if values[ix, iy, iz] != 0:
+                        values[ix, iy, iz] = cave_val
 
-    #  NOTE: check later 
-    #   write out the match for how we are carving everything 
-    for _ in range(octaves) :
 
-        n = pnoise3(
-        (x + 67) * scale * frequency,
-        (y + 67) * scale * frequency,
-        (z + 67) * scale * frequency,
-        octaves=1, base=seed
+def carve_along_spline(values, spline, radius, cave_val, step=0.5):
+    _, aps, _ = spline.discretize(step)
+    for ap in aps:
+        carve_sphere(values, ap[0], ap[1], ap[2], radius, cave_val)
+
+
+def gen_caves(values, ground_lvl, seed, cave_val=0, **kwargs):
+    gx, gy, gz = values.shape
+    y_offset = gy // 2
+    z_offset = 2
+
+    rng = random.Random(seed)
+
+    tunnel_network_params = TunnelNetworkParams(
+        collision_distance=6,
+        max_inclination_rad=np.deg2rad(30),
+        min_intersection_angle_rad=np.deg2rad(30),
+        min_distance_between_intersections=20,
+        flat=False,
+    )
+    tunnel_network = TunnelNetwork(params=tunnel_network_params, initial_node=False)
+
+    n_tunnels = rng.randint(2, 4)
+    n_connectors = rng.randint(0, 2)
+
+    for _ in range(n_tunnels):
+        length = rng.uniform(40, 80)
+        h_tend = rng.uniform(-30, 30)
+        v_tend = rng.uniform(-10, 10)
+        h_noise = rng.uniform(5, 15)
+        v_noise = rng.uniform(3, 8)
+        min_seg = rng.uniform(5, 10)
+        max_seg = rng.uniform(10, 20)
+
+        params = GrownTunnelGenerationParams(
+            distance=length,
+            horizontal_tendency_rad=np.deg2rad(h_tend),
+            vertical_tendency_rad=np.deg2rad(v_tend),
+            horizontal_noise_rad=np.deg2rad(h_noise),
+            vertical_noise_rad=np.deg2rad(v_noise),
+            min_segment_length=min_seg,
+            max_segment_length=max_seg,
+        )
+        success, tunnel = tunnel_network.add_random_grown_tunnel(
+            params=params,
+            n_trials=50,
+            yaw_range=(0, 2 * np.pi),
+        )
+        if not success:
+            continue
+
+    for _ in range(n_connectors):
+        if len(tunnel_network.tunnels) < 2:
+            break
+        conn_params = ConnectorTunnelGenerationParams(
+            segment_length=rng.uniform(8, 15),
+            node_position_horizontal_noise=rng.uniform(0, 3),
+            node_position_vertical_noise=rng.uniform(0, 2),
+        )
+        success, _ = tunnel_network.add_random_connector_tunnel(
+            params=conn_params,
+            n_trials=50,
         )
 
-        # noise vals created at each octave
-        value += amplitude * n 
-        max_amplitude += amplitude
-        amplitude *= persistance
-        frequency *= lacunarity
+    if len(tunnel_network.tunnels) == 0:
+        return values
 
+    for tunnel in tunnel_network.tunnels:
+        radius = rng.uniform(3.0, 6.0)
+        terrain_z = (
+            int(np.mean(ground_lvl[ground_lvl > 0]))
+            if np.any(ground_lvl > 0)
+            else gz // 2
+        )
+        spline = tunnel.spline
+        _, aps, _ = spline.discretize(0.5)
 
-    # Normalise values : 
-    # each octave contributes amp * n with n E [-1, 1], 
-    # max at every n = 1 means the sum(amplitudes) => dividing by this maps input to [-1,1]
-    return value / max_amplitude
+        positions = np.array(aps)
+        offset = np.array([gx * 0.3 + seed % 100, y_offset, terrain_z - z_offset])
+        positions += offset
 
+        for pos in positions:
+            carve_sphere(values, pos[0], pos[1], pos[2], radius, cave_val)
 
-def gen_caves(values, ground_lvl, seed, density = 0.012, room_sz = 1.5, cave_val=0):
-    gx, gy, gz = values.shape
-
-    for ix in range(gx):
-        for iy in range(gy):
-            terrrain_top = int(ground_lvl[ix, iy])
-            if terrrain_top<2:
-                continue
-            for iz in range(1, terrrain_top):
-                
-                effective_scale = 0.04 * room_sz # allow bigger rooms but keep all fine detail from higher octaves
-                effective_octaves = max(2, int(4/room_sz)) #fewer octaves for bigger rooms
-                noise_val = fractal_noise(ix, iy, iz, seed, scale=effective_scale,octaves=effective_octaves)
-                threshold = density + (1.0 - iz / terrrain_top) * 0.02
-                # depth biased threshol produces more caves near surface and fewer at depth (save power, deeper gen => bigger world gen )
-                # to invert to deeper gen just remove the 1 - in the brackets (idk why you'd want to tho ngl)
-
-                if noise_val > threshold:
-                    values[ix, iy, iz] = cave_val
     return values
-
-
-
-
-

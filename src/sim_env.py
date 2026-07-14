@@ -6,7 +6,7 @@ os.environ["__GLX_VENDOR_LIBRARY_NAME"] = "nvidia"
 # First two lines check waht they do, stephs computer doesnt run this shit without it ??
 # Telling your PC what the environment is
 
-import pyvista as pv
+import open3d as o3d
 import numpy as np
 from noise import pnoise2
 import random
@@ -15,8 +15,6 @@ from skimage.draw import line
 
 from drone import Drone
 import cave_gen
-
-pv.global_theme.allow_empty_mesh = True
 
 seed = random.randint(0, 10000)
 
@@ -326,77 +324,85 @@ def spawn_tree(tx, ty, tz, tree_height, tree_chance, tile_num):
             values[tx][ty][tz + i] = 2
 
 
+BLOCK_COLORS = {
+    1: [0.878, 0.478, 0.373],  # terrain   — #e07a5f
+    2: [0.263, 0.157, 0.094],  # trees     — #432818
+    3: [0.0, 0.706, 0.847],  # tree-line — #00b4d8
+    4: [1.0, 0.0, 0.0],  # end block — #ff0000
+    5: [0.0, 0.824, 0.055],  # start     — #00d20e
+    7: [1.0, 0.490, 0.0],  # path      — #ff7d00
+}
+
+
+def _voxel_grid(values, block_type, color):
+    dense = (values == block_type).astype(np.uint8)
+    if not dense.any():
+        return None
+    return o3d.geometry.VoxelGrid.create_from_dense(
+        dense, voxel_size=1.0, origin=[0, 0, 0], color=color
+    )
+
+
+def _camera(vis):
+    ctrl = vis.get_view_control()
+    ctrl.set_front([0, 0, -1])
+    ctrl.set_up([0, 1, 0])
+    ctrl.set_lookat([x / 2, y / 2, z / 2])
+    ctrl.set_zoom(0.8)
+    vis.get_render_option().background_color = np.array([30, 30, 40]) / 255.0
+
+
 def show_path(path_history, grid_snapshot=None):
-    # use a provided snapshot if available, otherwise fall back to the live grid
-    # (live grid is usually dirty with lidar 8-markers and drone 5-markers from training)
     display_values = grid_snapshot if grid_snapshot is not None else values
 
-    grid = pv.ImageData()
-    grid.dimensions = np.array(display_values.shape) + 1
-    grid.spacing = (1, 1, 1)
-    grid.origin = (0, 0, 0)
-    grid.cell_data["values"] = display_values.flatten(order="F")
+    vis = o3d.visualization.Visualizer()
+    vis.create_window()
 
-    plotter = pv.Plotter()
-    plotter.camera_position = "xy"
-    plotter.set_background([30, 30, 40])
-    plotter.add_mesh(
-        grid.threshold([0.5, 1.5], scalars="values"), color="#e07a5f", opacity=0.5
-    )  # terrain
-    plotter.add_mesh(
-        grid.threshold([1.5, 2.5], scalars="values"), color="#432818"
-    )  # trees
-    plotter.add_mesh(
-        grid.threshold([2.5, 3.5], scalars="values"), color="#00b4d8", opacity=0.1
-    )  # tree-line
-    plotter.add_mesh(
-        grid.threshold([3.5, 4.5], scalars="values"), color="#ff0000"
-    )  # end block
-    plotter.add_mesh(
-        grid.threshold([4.5, 5.5], scalars="values"), color="#00d20e"
-    )  # start/drone
+    for t, c in BLOCK_COLORS.items():
+        if t == 7:
+            continue
+        vg = _voxel_grid(display_values, t, c)
+        if vg is not None:
+            vis.add_geometry(vg)
 
     if len(path_history) > 1:
-        pts = np.array(path_history, dtype=np.float32)
-        spline = pv.Spline(pts, len(pts) * 10)
-        plotter.add_mesh(spline, color="#00d20e", line_width=3)
+        pts = np.array(path_history, dtype=np.float64)
+        lines = [[i, i + 1] for i in range(len(pts) - 1)]
+        ls = o3d.geometry.LineSet()
+        ls.points = o3d.utility.Vector3dVector(pts)
+        ls.lines = o3d.utility.Vector2iVector(lines)
+        ls.colors = o3d.utility.Vector3dVector([[0.0, 0.824, 0.055]] * len(lines))
+        vis.add_geometry(ls)
 
-    plotter.show()
+    _camera(vis)
+    vis.run()
+    vis.destroy_window()
 
 
 def show_grid(drone=None):
-    grid = pv.ImageData()
-    grid.dimensions = np.array(values.shape) + 1
-    grid.spacing = (1, 1, 1)
-    grid.origin = (0, 0, 0)
-    grid.cell_data["values"] = values.flatten(order="F")
+    vis = o3d.visualization.Visualizer()
+    vis.create_window()
 
-    terrain = grid.threshold([0.5, 1.5], scalars="values")
-    trees = grid.threshold([1.5, 2.5], scalars="values")
-    tree_line = grid.threshold([2.5, 3.5], scalars="values")
-    end_block = grid.threshold([3.5, 4.5], scalars="values")
-    drone_block = grid.threshold([4.5, 5.5], scalars="values")
-    path = grid.threshold([6.5, 7.5], scalars="values")
+    for t, c in BLOCK_COLORS.items():
+        vg = _voxel_grid(values, t, c)
+        if vg is not None:
+            vis.add_geometry(vg)
 
-    plotter = pv.Plotter()
-    plotter.camera_position = "xy"
-    plotter.set_background([30, 30, 40])
-    plotter.add_mesh(terrain, show_edges=False, color="#e07a5f", opacity=0.5)
-    plotter.add_mesh(trees, show_edges=False, color="#432818")
-    plotter.add_mesh(tree_line, show_edges=False, color="#00b4d8", opacity=0.1)
-    plotter.add_mesh(end_block, show_edges=False, color="#ff0000")
-    plotter.add_mesh(drone_block, show_edges=False, color="#00d20e")
-    plotter.add_mesh(path, show_edges=False, color="#ff7d00")
-
-    drone_point = None
+    drone_mesh = None
     if drone is not None:
-        drone_point = pv.Cube(center=drone.pos, x_length=1, y_length=1, z_length=1)
-        plotter.add_mesh(drone_point, color="#f15bb5")
-        plotter.show(interactive_update=True)
-    else:
-        plotter.show()
+        drone_mesh = o3d.geometry.TriangleMesh.create_box(width=1, height=1, depth=1)
+        drone_mesh.paint_uniform_color([0.945, 0.067, 0.714])
+        drone_mesh.translate(np.array(drone.pos) - 0.5)
+        vis.add_geometry(drone_mesh)
 
-    return plotter, drone_point
+    _camera(vis)
+
+    if drone is None:
+        vis.run()
+        vis.destroy_window()
+        return None, None
+
+    return vis, drone_mesh
 
 
 def main():
@@ -410,19 +416,26 @@ def main():
     print(f"Start: {start}, End: {end}")
 
     drone = Drone(id=0, sight_range=10, values=values, pos=start, goal=end)
-    plotter, drone_point = show_grid(drone)
-    assert drone_point is not None
+    vis, drone_mesh = show_grid(drone)
+    assert drone_mesh is not None
 
     prev_pos = drone.pos.copy()
+    step_count = [0]
 
-    def step(caller):
+    def step(vis):
+        if step_count[0] >= 1000:
+            vis.close()
+            return True
         direction = np.random.uniform(-1, 1, size=3)
         drone.move(direction, amount=1)
-        drone_point.translate(drone.pos - prev_pos, inplace=True)
+        drone_mesh.translate(drone.pos - prev_pos)
+        vis.update_geometry(drone_mesh)
         prev_pos[:] = drone.pos
+        step_count[0] += 1
+        return False
 
-    plotter.add_timer_event(max_steps=1000, duration=300, callback=step)
-    plotter.show()
+    vis.register_animation_callback(step)
+    vis.run()
 
 
 if __name__ == "__main__":

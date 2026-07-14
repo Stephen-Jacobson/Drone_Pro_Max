@@ -3,18 +3,28 @@ name = "drone-pro-max"
 version = "0.3.0"
 description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.14"
+requires-python = ">=3.12"
 dependencies = [
     "gymnasium>=1.2.3",
     "mavsdk>=3.15.3",
     "noise>=1.2.2",
     "numpy>=2.4.4",
     "pymavlink>=2.4.49",
-    "pyvista>=0.47.2",
+    "open3d>=0.18.0",
     "stable-baselines3>=2.8.0",
     "torch>=2.11.0",
     "scikit-image>=0.26.0",
     "scipy>=1.17.1",
     "torchrl>=0.13.2",
     "tqdm>=4.68.3",
+    "pyvista>=0.47.2",
+    "perlin_noise>=1.0",
+    "perlin_numpy @ git+https://github.com/pvigier/perlin-numpy",
+    "distinctipy>=1.3",
+    "pyyaml>=6.0",
+    "meshio>=5.0",
+    "SubterraneanProceduralGeneration",
 ]
+
+[tool.uv.sources]
+SubterraneanProceduralGeneration = { path = "lib/procedural-subt-gen", editable = true }
