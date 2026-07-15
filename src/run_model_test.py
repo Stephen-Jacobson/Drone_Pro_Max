@@ -7,6 +7,7 @@ import numpy as np
 import torch
 from torch import nn
 import open3d as o3d
+import matplotlib.pyplot as plt
 
 from tensordict.nn import TensorDictModule
 from tensordict.nn.distributions import NormalParamExtractor
@@ -20,9 +21,10 @@ from drone import Drone
 
 MAX_STEPS = 400
 num_cells = 512          # must match rl_model.py
-MAP_CHANNELS = 2         # must match rl_model.py
-CHECKPOINT_PATH = os.path.join(os.path.dirname(__file__), "..", "pax_v2_1.pt")
-FRAMES_PER_STEP = 10      # adjust this to slow down: higher = slower (1=normal speed)
+MAP_CHANNELS = 3         # must match drone_env.py's coverage_map channel count (material, completion, drone position)
+CHECKPOINT_PATH = os.path.join(os.path.dirname(__file__), "..", "pax_v2_3.pt")
+FRAMES_PER_STEP = 20      # adjust this to slow down: higher = slower (1=normal speed)
+TEST_REGION_DONE_THRESHOLD = 0.50
 
 
 # ── rebuild model architecture (must match rl_model.py exactly) ──────────────
@@ -30,7 +32,7 @@ FRAMES_PER_STEP = 10      # adjust this to slow down: higher = slower (1=normal 
 # trained architecture exactly, or load_state_dict will fail / silently
 # load into the wrong shapes.
 class CNNActorNet(nn.Module):
-    def __init__(self, num_cells, action_dim, map_channels=2, device=None):
+    def __init__(self, num_cells, action_dim, map_channels=3, device=None):
         super().__init__()
 
         self.cnn = nn.Sequential(
@@ -100,7 +102,7 @@ def build_policy(action_dim, device):
         return_log_prob=True,
     )
 
-    return policy_module
+    return policy_module, actor_net
 
 
 def build_world():
@@ -125,11 +127,11 @@ def main():
     start, end, clean_grid = build_world()
     print(f"Start: {start}")
 
-    env = DroneEnv(clean_grid.copy(), start, end)
+    env = DroneEnv(clean_grid.copy(), start, end, region_done_threshold=TEST_REGION_DONE_THRESHOLD)
 
     # ── build & load policy ───────────────────────────────────────────────
     action_dim = env.action_spec.shape[-1]
-    policy = build_policy(action_dim, device)
+    policy, actor_net = build_policy(action_dim, device)
 
     # warm up lazy layers so state_dict loads cleanly
     dummy = env.reset().to(device)
@@ -141,23 +143,91 @@ def main():
     policy.eval()
     print("Model loaded.")
 
+    # ── NEW: hook the CNN's last conv/ReLU block (index 5 of actor_net.cnn --
+    # the ReLU right after the third LazyConv2d, BEFORE Flatten/LazyLinear)
+    # so we can grab the spatial feature maps the network actually produces
+    # from coverage_map, not just its final flattened num_cells vector.
+    # Shape out of this layer is (batch, 32, H/4, W/4) given the two
+    # stride-2 convs -- we keep it as-is (no upsampling) and just display it
+    # at its native resolution.
+    _last_cnn_feat = {}
+
+    def _capture_cnn_feat(module, inputs, output):
+        _last_cnn_feat["value"] = output.detach()
+
+    actor_net.cnn[5].register_forward_hook(_capture_cnn_feat)
+
     # ── run rollout, collect path + spray history ───────────────────────────
     td = env.reset().to(device)
     path_history = [env.drone.pos.copy()]
+    # NEW: coverage_map history -- one (3, H, W) array per step, straight from
+    # the tensordict the env already returns (channel 0 = material/active-region,
+    # channel 1 = spray-completion fraction, channel 2 = drone position). Used
+    # to drive a live 2D viewer kept in lockstep with the 3D playback below,
+    # no recomputation needed.
+    coverage_history = [td["coverage_map"].cpu().numpy()]
+    # NEW: one (32, H/4, W/4) feature-map array per step, captured from the
+    # CNN's last conv block via the hook above. cnn_feat_history[i] is what
+    # the network internally produced FROM coverage_history[i] -- populated
+    # here for the reset state (index 0), then appended in-loop right after
+    # each policy(td) call below (which is exactly when the hook fires for
+    # that step's coverage_map).
+    with torch.no_grad():
+        actor_net(td["coverage_map"], td["flat"])
+    cnn_feat_history = [_last_cnn_feat["value"].cpu().numpy()[0]]
+    # NEW: which region is active, and its TRUE region-wide completeness
+    # fraction (region_completeness()), at each step. The completion channel
+    # (coverage_history[i][1]) is a GLOBAL hit-count map -- a small, densely
+    # -sprayed patch can look "100% done" there while the rest of a large or
+    # oddly-shaped active region (see coverage_history[i][0]) still sits at
+    # 0 hits, indistinguishable from background. This is the number that
+    # actually gates the region-complete hand-off, so it's worth tracking
+    # separately rather than eyeballing the heatmap.
+    active_id_history = [env.active_region_id]
+    active_completeness_history = [
+        env.spray_tracker.region_completeness().get(env.active_region_id, 0.0)
+        if env.active_region_id is not None else None
+    ]
+    # region labels are only rebuilt on _reset(), so this is constant for the
+    # whole episode -- safe to snapshot once here.
+    region_labels = env.labels.copy()
     spray_history = []   # hit_xyz arrays, one per step, for the lineset animation
+    # NEW: active-region centroid at each step, for the pink pointer line
+    # showing where the drone is currently trying to go. None once every
+    # needs-water region has been finished (active_region_id goes to None).
+    def _active_target():
+        rid = env.active_region_id
+        return env.spray_tracker.region_centroid(rid) if rid is not None else None
+    target_history = [_active_target()]
     spray_steps = 0      # how many steps the policy actually chose to spray on
+    total_reward = 0.0   # NEW: cumulative reward across the rollout
 
     with set_exploration_type(ExplorationType.DETERMINISTIC), torch.no_grad():
         for step in range(MAX_STEPS):
             td = policy(td.to(device))
+            # hook fired during the policy(td) call just above, capturing
+            # the CNN's response to THIS step's coverage_map (same one that
+            # was appended to coverage_history at the end of the previous
+            # iteration / at reset) -- so this stays index-aligned with
+            # coverage_history despite being appended one line early.
+            cnn_feat_history.append(_last_cnn_feat["value"].cpu().numpy()[0])
             action = td["action"].cpu().numpy()
             spray_flag = action[..., 3] > 0
             if spray_flag:
                 spray_steps += 1
 
             td = env._step(td)
+            reward = td["reward"].item()
+            total_reward += reward
 
+            coverage_history.append(td["coverage_map"].cpu().numpy())
+            active_id_history.append(env.active_region_id)
+            active_completeness_history.append(
+                env.spray_tracker.region_completeness().get(env.active_region_id, 0.0)
+                if env.active_region_id is not None else None
+            )
             path_history.append(env.drone.pos.copy())
+            target_history.append(_active_target())
 
             # Re-fire spray purely for the visual lineset -- DroneEnv already
             # registered the real hits internally during _step(); this call
@@ -173,7 +243,8 @@ def main():
             mean_comp = float(np.mean(list(comp.values()))) if comp else 1.0
 
             if step % 10 == 0:
-                print(f"  step {step:4d} | coverage: {mean_comp:.2%} | hit: {hit} | done: {done}")
+                print(f"  step {step:4d} | coverage: {mean_comp:.2%} | hit: {hit} | done: {done} "
+                      f"| reward: {reward:+.4f} | total: {total_reward:+.4f}")
 
             if done:
                 if hit:
@@ -202,9 +273,18 @@ def main():
                       f"({needs_total / map_total:.2%} of the map)")
                 print(f"  sprayed on {spray_steps}/{step + 1} steps "
                       f"({spray_steps / (step + 1):.2%} of the episode)")
+                print(f"  total reward for this rollout: {total_reward:+.4f} "
+                      f"({total_reward / (step + 1):+.4f} avg/step)")
                 break
 
             td = td.select("coverage_map", "flat").to(device)
+        else:
+            # loop exhausted MAX_STEPS without the env ever reporting done
+            # (e.g. MAX_STEPS set lower than env.max_steps) -- still report
+            # what was accumulated so this isn't silently skipped.
+            print(f"Reached MAX_STEPS ({MAX_STEPS}) without the env reporting done.")
+            print(f"  total reward for this rollout: {total_reward:+.4f} "
+                  f"({total_reward / MAX_STEPS:+.4f} avg/step)")
 
     print(f"Rollout finished — {len(path_history)} positions recorded.")
 
@@ -215,6 +295,10 @@ def main():
     vis_drone = Drone(0, 10, env.values, start, end)
     drone_mesh = sim.make_drone_mesh(vis_drone)
     spray_lineset = sim.make_spray_lineset(vis_drone.get_position(), np.zeros((0, 3)))
+
+    # --- NEW: pink pointer line from the drone to whichever region it's
+    # currently trying to reach (DroneEnv.active_region_id's centroid).
+    target_lineset = sim.make_target_lineset(vis_drone.get_position(), target_history[0])
 
     # --- NEW: trail LineSet tracing the drone's flight path so far.
     # Starts with just the initial point (no segments yet); advance()
@@ -227,6 +311,103 @@ def main():
     path_lineset.colors = o3d.utility.Vector3dVector(np.zeros((0, 3)))
     PATH_COLOR = (0.1, 0.4, 1.0)  # blue, distinct from spray's green
 
+    # ── live coverage-map viewer (matplotlib, separate window) ──────────────
+    # Four panels: channel 0 (material -- 0.3 no-water, 0.6 needs-water
+    # queued, 1.0 active region), channel 1 (spray-completion fraction,
+    # 0-1), channel 2 (drone position -- a single 1.0 cell), and NEW: the
+    # CNN's own internal feature map for this step -- the mean across its
+    # 32 output channels from the last conv block (actor_net.cnn[5]),
+    # before Flatten/LazyLinear. This is at the CNN's native (downsampled)
+    # resolution, not upsampled back to the map's H x W, since that's
+    # literally the spatial resolution the policy is reasoning at. Updated
+    # in lockstep with the 3D playback's advance() callback below, so all
+    # four windows step forward together.
+    plt.ion()
+    cov_fig, (cov_ax_mat, cov_ax_comp, cov_ax_pos, cov_ax_cnn) = plt.subplots(1, 4, figsize=(17, 4.5))
+    cov_fig.canvas.manager.set_window_title("Coverage Map (live)")
+
+    cov0 = coverage_history[0]
+    im_material = cov_ax_mat.imshow(cov0[0].T, origin="lower", cmap="viridis", vmin=0.0, vmax=1.0)
+    cov_ax_mat.set_title("Material / active region")
+    cov_fig.colorbar(im_material, ax=cov_ax_mat, fraction=0.046)
+
+    im_completion = cov_ax_comp.imshow(cov0[1].T, origin="lower", cmap="viridis", vmin=0.0, vmax=1.0)
+    cov_ax_comp.set_title("Spray completion")
+    cov_fig.colorbar(im_completion, ax=cov_ax_comp, fraction=0.046)
+
+    im_position = cov_ax_pos.imshow(cov0[2].T, origin="lower", cmap="viridis", vmin=0.0, vmax=1.0)
+    cov_ax_pos.set_title("Drone position")
+    cov_fig.colorbar(im_position, ax=cov_ax_pos, fraction=0.046)
+
+    cnn0 = cnn_feat_history[0].mean(axis=0)  # (32, h', w') -> (h', w')
+    im_cnn = cov_ax_cnn.imshow(cnn0.T, origin="lower", cmap="magma")
+    cov_ax_cnn.set_title("CNN feature map (mean of 32 ch.)")
+    cov_fig.colorbar(im_cnn, ax=cov_ax_cnn, fraction=0.046)
+
+    cov_suptitle = cov_fig.suptitle("step 0")
+    cov_fig.tight_layout()
+    cov_fig.canvas.draw()
+    plt.pause(0.001)
+
+    def _update_coverage_view(step_i):
+        """Redraw the live matplotlib panels for coverage_history[step_i].
+        No-ops quietly if the person closed the coverage window.
+
+        The completion panel (channel 1) is a GLOBAL hit-count map, so a
+        region's actual boundary isn't visible in it -- a densely-sprayed
+        patch can look fully yellow while most of a larger/odd-shaped
+        region sits untouched just outside that patch, still reading as
+        the same dark "0" background. To make that visible instead of
+        misleading, this draws a red contour of the ACTIVE region's real
+        footprint (from the constant region_labels grid) on top of the
+        completion heatmap, and prints its true region_completeness()
+        fraction in the title -- that fraction, not how full the yellow
+        blob looks, is what actually gates the region-complete hand-off.
+
+        CHANGED: the drone's position used to be drawn as a manually-added
+        dot overlay on the material/completion panels, since coverage_map
+        itself had no notion of "where the drone is". Now that the env
+        bakes drone position into channel 2 directly, this panel shows
+        exactly that raw channel instead -- what's on screen is literally
+        the same array values the policy is looking at, same as the other
+        two panels, rather than a debug annotation layered on top.
+        """
+        if not plt.fignum_exists(cov_fig.number):
+            return
+        if step_i >= len(coverage_history):
+            return
+        cov = coverage_history[step_i]
+        active_id = active_id_history[step_i] if step_i < len(active_id_history) else None
+        comp_frac = active_completeness_history[step_i] if step_i < len(active_completeness_history) else None
+
+        cov_ax_mat.clear()
+        cov_ax_mat.imshow(cov[0].T, origin="lower", cmap="viridis", vmin=0.0, vmax=1.0)
+        cov_ax_mat.set_title("Material / active region")
+
+        cov_ax_comp.clear()
+        cov_ax_comp.imshow(cov[1].T, origin="lower", cmap="viridis", vmin=0.0, vmax=1.0)
+        if active_id is not None:
+            mask = (region_labels == active_id).astype(float)
+            cov_ax_comp.contour(mask.T, levels=[0.5], colors="red", linewidths=1.5)
+            comp_str = f"{comp_frac:.1%}" if comp_frac is not None else "?"
+            cov_ax_comp.set_title(f"Spray completion (active region: {comp_str})")
+        else:
+            cov_ax_comp.set_title("Spray completion (no active region -- all done)")
+
+        cov_ax_pos.clear()
+        cov_ax_pos.imshow(cov[2].T, origin="lower", cmap="viridis", vmin=0.0, vmax=1.0)
+        cov_ax_pos.set_title("Drone position")
+
+        cov_ax_cnn.clear()
+        if step_i < len(cnn_feat_history):
+            feat = cnn_feat_history[step_i].mean(axis=0)  # (32, h', w') -> (h', w')
+            cov_ax_cnn.imshow(feat.T, origin="lower", cmap="magma")
+        cov_ax_cnn.set_title("CNN feature map (mean of 32 ch.)")
+
+        cov_suptitle.set_text(f"step {step_i}")
+        cov_fig.canvas.draw_idle()
+        cov_fig.canvas.flush_events()
+
     vis = o3d.visualization.VisualizerWithKeyCallback()
     vis.create_window(window_name="Drone Rollout Playback", width=1024, height=768)
     for geom in terrain_geoms:
@@ -234,6 +415,7 @@ def main():
     vis.add_geometry(drone_mesh)
     vis.add_geometry(spray_lineset)
     vis.add_geometry(path_lineset)
+    vis.add_geometry(target_lineset)
     vis.get_render_option().line_width = 4.0
 
     state = {"paused": False, "step_index": 0, "last_pos": np.array(start, dtype=np.float32), "frame_count": 0}
@@ -269,6 +451,16 @@ def main():
         spray_lineset.colors = fresh_lineset.colors
         vis_.update_geometry(spray_lineset)
 
+        # --- NEW: re-point the pink target line at this step's active
+        # region centroid (target_history[i] lines up with path_history[i],
+        # both recorded once per step -- see the rollout loop above).
+        target_xy = target_history[i] if i < len(target_history) else None
+        fresh_target = sim.make_target_lineset(new_pos, target_xy)
+        target_lineset.points = fresh_target.points
+        target_lineset.lines = fresh_target.lines
+        target_lineset.colors = fresh_target.colors
+        vis_.update_geometry(target_lineset)
+
         # --- NEW: extend the path trail with a segment from the previous
         # point to this one. Rebuilding points/lines/colors each frame is
         # cheap at this scale (at most a few hundred points for MAX_STEPS=600).
@@ -281,6 +473,9 @@ def main():
         )
         vis_.update_geometry(path_lineset)
 
+        # NEW: keep the live coverage-map window in lockstep with this step.
+        _update_coverage_view(i)
+
         state["step_index"] += 1
         return True
 
@@ -288,6 +483,8 @@ def main():
     print("Press SPACE to pause/resume playback. Rotate/zoom/pan anytime — close window to exit.")
     vis.run()
     vis.destroy_window()
+    if plt.fignum_exists(cov_fig.number):
+        plt.close(cov_fig)
 
 
 if __name__ == "__main__":

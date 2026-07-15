@@ -14,6 +14,29 @@ def get_goal_vector(drone_pos, goal_pos, max_range):
     direction = diff / (distance + 1e-8)                    # (3,) unit vector, avoid div/0
     return direction, distance / max_range                  # both normalised
 
+
+def get_target_vector(drone_pos, target_xy, max_range):
+    """Same idea as get_goal_vector(), but for a horizontal-only target
+    (e.g. a region's (x, y) footprint centroid) rather than a full 3D goal.
+    The z component of the returned direction is always 0 -- the drone's
+    altitude doesn't matter for "which way is the region" purposes.
+
+    Args:
+        drone_pos:  (3,) float array/tuple, drone's current position
+        target_xy:  (2,) float array/tuple, the target's (x, y)
+        max_range:  scalar used to normalise the returned distance
+
+    Returns:
+        direction: (3,) unit vector, z always 0
+        distance:  scalar, normalised by max_range
+    """
+    dx = float(target_xy[0]) - float(drone_pos[0])
+    dy = float(target_xy[1]) - float(drone_pos[1])
+    diff = np.array([dx, dy, 0.0], dtype=np.float32)
+    distance = np.linalg.norm(diff)
+    direction = diff / (distance + 1e-8)
+    return direction, distance / max_range
+
 def cast_all_rays(values, origin, directions, max_range, thickness=1):
     """March ALL rays together each step instead of one at a time."""
     N = len(directions)

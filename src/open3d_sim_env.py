@@ -535,6 +535,43 @@ def make_spray_lineset(origin, hit_xyz, color=(0.0, 1.0, 0.0)):
     return line_set
 
 
+def make_target_lineset(origin, target_xy, color=(1.0, 0.1, 0.85)):
+    """Build a single bright-pink LineSet segment from the drone's current
+    position to the (x, y) footprint centroid of whichever region it's
+    currently trying to reach -- a visual "pointer" toward the active
+    navigation target (e.g. DroneEnv.active_region_id's centroid).
+
+    `target_xy` is None when there's no active target (e.g. every
+    needs-water region is already finished), in which case an empty (but
+    valid) LineSet is returned so update_geometry() still has something
+    consistent to swap in.
+
+    The target point is drawn at the drone's own height, not the ground's --
+    this is a directional pointer, not a spray/impact marker like
+    make_spray_lineset(), so there's no meaningful z to hit.
+    """
+    origin = np.asarray(origin, dtype=np.float64) + 0.5  # match voxel-center offset
+
+    line_set = o3d.geometry.LineSet()
+    if target_xy is None:
+        line_set.points = o3d.utility.Vector3dVector(np.zeros((0, 3)))
+        line_set.lines = o3d.utility.Vector2iVector(np.zeros((0, 2), dtype=np.int32))
+        line_set.colors = o3d.utility.Vector3dVector(np.zeros((0, 3)))
+        return line_set
+
+    target_point = np.array(
+        [target_xy[0] + 0.5, target_xy[1] + 0.5, origin[2]], dtype=np.float64
+    )
+    points = np.vstack([origin[None, :], target_point[None, :]])
+    lines = np.array([[0, 1]], dtype=np.int32)
+    colors = np.array([color], dtype=np.float64)
+
+    line_set.points = o3d.utility.Vector3dVector(points)
+    line_set.lines = o3d.utility.Vector2iVector(lines)
+    line_set.colors = o3d.utility.Vector3dVector(colors)
+    return line_set
+
+
 def make_drone_mesh(drone, radius=0.4):
     """Build a small sphere mesh for the drone, colored from drone.get_color()
     and centered on the drone's true float position (+0.5 to match the same

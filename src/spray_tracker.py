@@ -31,7 +31,7 @@ class SprayTracker(object):
         # be considered watered. Defaults to one-fifth of the spray cone size,
         # which keeps the old behavior but makes the threshold explicit.
         if required_hits_per_cell is None:
-            required_hits_per_cell = max(1, int(np.ceil(float(n_rays) / 5.0)))
+            required_hits_per_cell = max(1, int(np.ceil(float(n_rays) / 10.0)))
         self.required_hits_per_cell = int(required_hits_per_cell)
 
         # Which regions actually need watering vs. shouldn't be sprayed,
@@ -43,10 +43,17 @@ class SprayTracker(object):
 
         # Cache each region's total cell count once (doesn't change over time).
         self._region_total_cells = {}
+        # NEW: cache each region's (x, y) footprint centroid too -- this is
+        # what lets a drone (or DroneEnv) ask "which region is closest to
+        # here" for one-region-at-a-time targeting.
+        self.region_centroids = {}
         for region_id in np.unique(self.labels):
             if region_id <= 0:
                 continue
-            self._region_total_cells[region_id] = int((self.labels == region_id).sum())
+            mask = (self.labels == region_id)
+            self._region_total_cells[region_id] = int(mask.sum())
+            xs, ys = np.nonzero(mask)
+            self.region_centroids[region_id] = np.array([xs.mean(), ys.mean()], dtype=np.float32)
 
     def register_hits(self, hit_xyz):
         """Record spray hits. `hit_xyz` is the (K, 3) array returned by
@@ -95,6 +102,41 @@ class SprayTracker(object):
         total = sum(t for rid, (t, w) in counts.items() if rid in self.needs_water_regions)
         watered = sum(w for rid, (t, w) in counts.items() if rid in self.needs_water_regions)
         return watered / total if total > 0 else 1.0
+
+    def region_centroid(self, region_id):
+        """(x, y) footprint centroid of a region, or None if unknown."""
+        return self.region_centroids.get(region_id)
+
+    def closest_region(self, region_ids, from_xy):
+        """Of the regions in `region_ids`, return the (region_id, distance)
+        of whichever has its centroid closest to `from_xy` (an (x, y)
+        point). Returns (None, None) if `region_ids` is empty -- e.g. there
+        are no needs-water regions left to target.
+
+        Used for one-region-at-a-time targeting: pick the nearest
+        needs-water region to spawn in on, then the nearest *remaining* one
+        each time the active region gets finished.
+        """
+        from_xy = np.asarray(from_xy, dtype=np.float32)
+        best_id, best_dist = None, None
+        for rid in region_ids:
+            centroid = self.region_centroids.get(rid)
+            if centroid is None:
+                continue
+            dist = float(np.linalg.norm(centroid - from_xy))
+            if best_dist is None or dist < best_dist:
+                best_id, best_dist = rid, dist
+        return best_id, best_dist
+
+    def useful_hits_for_region(self, region_id):
+        """Sum of spray-ray hits landed on a single region's cells, each
+        capped at required_hits_per_cell -- the single-region equivalent of
+        needs_water_total_completeness()'s numerator. Used to reward spray
+        hits on just the currently-active region instead of all needs-water
+        regions at once."""
+        mask = (self.labels == region_id)
+        capped_hits = np.clip(self.hit_counts, 0, self.required_hits_per_cell)
+        return float(capped_hits[mask].sum())
 
     def overspray_counts(self):
         """dict region_id -> total hit count landed on regions that should

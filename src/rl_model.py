@@ -37,7 +37,7 @@ import open3d_sim_env as sim
  
 MAX_STEPS = 400
 VISUALISE = False
-CHECKPOINT_PATH = os.path.join(os.path.dirname(__file__), "..", "pax_v2_1.pt")
+CHECKPOINT_PATH = os.path.join(os.path.dirname(__file__), "..", "pax_v2_3.pt")
 
 if __name__ == "__main__":
     is_fork = multiprocessing.get_start_method() == "fork"
@@ -53,8 +53,16 @@ if __name__ == "__main__":
     print(f"training on {device}")
     
     steps_per_batch = 1600          # how many moves will make before model learns from it, so model isnt updating until steps_per_batch moves have been done, 1 step = 1 move
-    total_steps = 500_000            # how many total steps until done training
+    total_steps = 1_000_000            # how many total steps until done training
     #therefore if 1000 steps in batch and 50000 steps total, will learn 50000/1000 = 50 times
+
+    # --- REGION_DONE_THRESHOLD staircase curriculum, spread evenly across total_steps ---
+    # Instead of a continuous ramp, training is chopped into this many equal
+    # stages; REGION_DONE_THRESHOLD jumps by one fixed increment at each
+    # stage boundary (flat within a stage). All three are decided/changeable:
+    REGION_DONE_THRESHOLD_START = 0.01      # threshold for stage 0 (start of training)
+    REGION_DONE_THRESHOLD_END = 0.50        # threshold for the final stage
+    REGION_DONE_THRESHOLD_INTERVALS = 8     # number of stepped stages spanning total_steps
     
     # PPO Parameters (Proximal Policy Optimization)
         # At each steps_per_batch we will run to optimise model, this is done by taking a sub batch size, eg 64,
@@ -72,9 +80,9 @@ if __name__ == "__main__":
     
     def build_world(progress=0.0):
         """Generate a fresh terrain using open3d_sim_env and return a drone
-        start position, a dummy goal, a clean grid snapshot, and the prob4
-        for this generation (probability a crop region gets painted
-        "needs water" vs "doesn't").
+        start position, a dummy goal, a clean grid snapshot, the prob4 for
+        this generation (probability a crop region gets painted "needs
+        water" vs "doesn't"), and the current stepped REGION_DONE_THRESHOLD.
 
         `progress` is training progress in [0, 1] (frames_collected / total_steps).
         It drives a curriculum on water-region density via sim.water_region_prob():
@@ -85,6 +93,15 @@ if __name__ == "__main__":
         every single episode reset regardless of what materials this function's
         voxels already have baked in. Baking regions in here would just get
         silently overwritten.
+
+        `progress` also drives a SEPARATE, stepped (staircase) curriculum on
+        REGION_DONE_THRESHOLD via DroneEnv.region_done_threshold_for_progress():
+        total_steps is chopped into REGION_DONE_THRESHOLD_INTERVALS equal
+        stages, and the threshold jumps by a fixed increment at each stage
+        boundary instead of ramping continuously. Unlike prob4, this value
+        IS passed straight into DroneEnv's constructor (region_done_threshold=),
+        since it's just an instance attribute read each _get_reward() call,
+        not something baked into the voxel grid that _reset() would overwrite.
 
         NOTE: no terrain-size curriculum here -- open3d_sim_env.py hardcodes
         max_x/max_y=300 as module globals, unlike the old sim_env's set_dim().
@@ -98,19 +115,25 @@ if __name__ == "__main__":
         dropping from `flat` in DroneEnv._get_obs() later if it doesn't help.
         """
         prob4 = sim.water_region_prob(progress)
+        region_done_threshold = DroneEnv.region_done_threshold_for_progress(
+            progress,
+            start=REGION_DONE_THRESHOLD_START,
+            end=REGION_DONE_THRESHOLD_END,
+            n_intervals=REGION_DONE_THRESHOLD_INTERVALS,
+        )
         voxels = sim.generate_voxels()      # terrain + crop-plot paths, one call (no regions yet)
         drone = sim.spawn_drone(voxels)     # safe, non-colliding spawn point
         start = drone.get_position()
         end = start.copy()
 
         clean = voxels.copy()  # snapshot BEFORE DroneEnv labels/paints it
-        return start, end, clean, prob4
+        return start, end, clean, prob4, region_done_threshold
 
-    start, end, clean_grid, prob4 = build_world(progress=0.0)
+    start, end, clean_grid, prob4, region_done_threshold = build_world(progress=0.0)
 
     def make_env():
         v = clean_grid.copy()  # each env gets its own copy of the guaranteed-clean grid
-        return DroneEnv(v, start, end, prob4=prob4)
+        return DroneEnv(v, start, end, prob4=prob4, region_done_threshold=region_done_threshold)
 
     base_env = ParallelEnv(16, make_env)
     env = TransformedEnv(base_env, StepCounter(max_steps=MAX_STEPS))
@@ -128,7 +151,7 @@ if __name__ == "__main__":
     # )
 
     class CNNActorNet(nn.Module):
-        def __init__(self, num_cells, action_dim, map_channels=2, device=None):
+        def __init__(self, num_cells, action_dim, map_channels=3, device=None):
             super().__init__()
 
             self.cnn = nn.Sequential(
@@ -206,7 +229,7 @@ if __name__ == "__main__":
     # )
 
     class CNNValueNet(nn.Module):
-        def __init__(self, num_cells, map_channels=2, device=None):
+        def __init__(self, num_cells, map_channels=3, device=None):
             super().__init__()
 
             self.cnn = nn.Sequential(
@@ -325,7 +348,7 @@ if __name__ == "__main__":
         # regenerate terrain periodically so the model trains on varied worlds
         if i > 0 and i % REGEN_EVERY == 0:
 
-            start, end, clean_grid, prob4 = build_world(progress=frames_collected / total_steps)
+            start, end, clean_grid, prob4, region_done_threshold = build_world(progress=frames_collected / total_steps)
             # collector.shutdown() already closed base_env — don't call base_env.close()
             collector.shutdown()
             del collector, base_env, env
@@ -349,7 +372,7 @@ if __name__ == "__main__":
         # visualise one rollout every 10th batch via a standalone env
         # (base_env is a ParallelEnv proxy — path_history/record don't reach workers)
         if i % 50 == 0 and VISUALISE:
-            vis_env = DroneEnv(clean_grid.copy(), start, end, prob4=prob4)
+            vis_env = DroneEnv(clean_grid.copy(), start, end, prob4=prob4, region_done_threshold=region_done_threshold)
             vis_env.record = True
             td_vis = vis_env.reset()
             with set_exploration_type(ExplorationType.DETERMINISTIC), torch.no_grad():
@@ -399,6 +422,7 @@ if __name__ == "__main__":
 
         logs["lr"].append(optim.param_groups[0]["lr"])
         lr_str = f"lr policy: {logs['lr'][-1]: 4.4f}"
+        region_done_str = f"region-done thresh: {region_done_threshold:.3f}"
         if i % 10 == 0:
             with set_exploration_type(ExplorationType.DETERMINISTIC), torch.no_grad():
                 eval_rollout = env.rollout(1000, policy_module)
@@ -413,7 +437,7 @@ if __name__ == "__main__":
                     f"eval std: {logs['eval_policy_std'][-1]: 4.4f}"
                 )
                 del eval_rollout
-        pbar.set_description(", ".join([cum_reward_str, stepcount_str, std_str, lr_str]))
+        pbar.set_description(", ".join([cum_reward_str, stepcount_str, std_str, lr_str, region_done_str]))
         stats_bar.set_description(eval_str)
         scheduler.step()
 
