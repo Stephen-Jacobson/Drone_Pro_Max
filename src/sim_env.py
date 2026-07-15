@@ -1,17 +1,17 @@
-import os  # have to do this so it works for me, idk why, delete if it messes with things
+import os
 
 os.environ["__NV_PRIME_RENDER_OFFLOAD"] = "1"
 os.environ["__GLX_VENDOR_LIBRARY_NAME"] = "nvidia"
 
-# First two lines check waht they do, stephs computer doesnt run this shit without it ??
-# Telling your PC what the environment is
-
+import time
 import open3d as o3d
 import numpy as np
 from noise import pnoise2
 import random
 from scipy.interpolate import CubicSpline
 from skimage.draw import line
+
+import pyvista as pv
 
 from drone import Drone
 import cave_gen
@@ -28,7 +28,7 @@ def reseed(new_seed=None):
     seed = new_seed if new_seed is not None else random.randint(0, 10000)
 
 
-x, y, z = 300, 50, 100
+x, y, z = 300, 300, 200
 
 
 def set_dim(nx, ny, nz=100):
@@ -49,7 +49,7 @@ tree_line_height = 15
 tree_line_recede = 0
 tree_density = 0.01
 # Ion evven know what the rigt value is supposed to be here tbh
-cave_density = 0.015
+cave_density = 0.05
 cave_room_size = 1.5
 
 # gets height per x y spot on grid to give a bumpy terrain, from gpt, for bumpier, increase octaves, persistence, amplitude, for less bumpy, decrease octaves, persistence eg 0.3, lower scale
@@ -294,16 +294,15 @@ def generate_terrain():
                 values[i][j][k] = 1
             # if scale > 0.7:
             #     tree_line_z = int(fractal_height(i, j, scale=scale-scale*0.5));
-            for k in range(tree_line_height + 1, z - terr_z):
-                recede = tree_line_height + 1 + tree_line_recede
+            # for k in range(tree_line_height + 1, z - terr_z):
+            #     recede = tree_line_height + 1 + tree_line_recede
 
-                if values[i][j][terr_z + k] == 0 and terr_z + k > recede:
-                    values[i][j][terr_z + k] = 3
+            #     if values[i][j][terr_z + k] == 0 and terr_z + k > recede:
+            #         values[i][j][terr_z + k] = 3
 
     # NOTE: cave_gen entry point
-    cave_gen.gen_caves(
-        values, ground_level, seed, density=cave_density, room_sz=cave_room_size
-    )
+#    cave_gen.gen_caves(
+#        values, ground_level, seed, density=cave_density, room_sz=cave_room_size)
 
 
 def generate_trees(tree_chance=tree_density, tree_height=15, gen_trees=True):
@@ -335,21 +334,35 @@ BLOCK_COLORS = {
 
 
 def _voxel_grid(values, block_type, color):
-    dense = (values == block_type).astype(np.uint8)
+    dense = values == block_type
     if not dense.any():
         return None
-    return o3d.geometry.VoxelGrid.create_from_dense(
-        dense, voxel_size=1.0, origin=[0, 0, 0], color=color
-    )
+    coords = np.argwhere(dense).astype(np.float64) + 0.5
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(coords)
+    pcd.colors = o3d.utility.Vector3dVector(np.tile(color, (len(coords), 1)))
+    return o3d.geometry.VoxelGrid.create_from_point_cloud(pcd, voxel_size=1.0)
 
 
-def _camera(vis):
+def _camera(vis, lookat=None):
     ctrl = vis.get_view_control()
-    ctrl.set_front([0, 0, -1])
+    if lookat is None:
+        lookat = [x / 2, y / 2, z / 2]
+    ctrl.set_front([-0.3, -0.5, -0.8])
     ctrl.set_up([0, 1, 0])
-    ctrl.set_lookat([x / 2, y / 2, z / 2])
-    ctrl.set_zoom(0.8)
+    ctrl.set_lookat(lookat)
+    ctrl.set_zoom(0.6)
     vis.get_render_option().background_color = np.array([30, 30, 40]) / 255.0
+
+
+def _find_cave_positions():
+    z_idx = np.arange(z, dtype=np.int16)
+    below_ground = z_idx[None, None, :] < ground_level[:, :, None]
+    cave_mask = (values == 0) & below_ground
+    coords = np.argwhere(cave_mask)
+    if len(coords) == 0:
+        return []
+    return [tuple(c) for c in coords]
 
 
 def show_path(path_history, grid_snapshot=None):
@@ -379,63 +392,96 @@ def show_path(path_history, grid_snapshot=None):
     vis.destroy_window()
 
 
-def show_grid(drone=None):
-    vis = o3d.visualization.Visualizer()
-    vis.create_window()
+def _make_terrain_mesh():
+    solid = np.isin(values, [1, 2, 3]).astype(np.uint8)
+    grid = pv.ImageData()
+    grid.dimensions = np.array(solid.shape) + 1
+    grid.origin = (0, 0, 0)
+    grid.spacing = (1, 1, 1)
+    grid.cell_data["solid"] = solid.ravel(order="F")
+    grid_pd = grid.cell_data_to_point_data()
+    return grid_pd.contour([0.5], scalars="solid", compute_normals=True)
 
-    for t, c in BLOCK_COLORS.items():
-        vg = _voxel_grid(values, t, c)
-        if vg is not None:
-            vis.add_geometry(vg)
+
+def show_grid(drone=None):
+    pl = pv.Plotter()
+
+    terrain = _make_terrain_mesh()
+    pl.add_mesh(terrain, color="#e07a5f", smooth_shading=True)
 
     drone_mesh = None
     if drone is not None:
-        drone_mesh = o3d.geometry.TriangleMesh.create_box(width=1, height=1, depth=1)
-        drone_mesh.paint_uniform_color([0.945, 0.067, 0.714])
-        drone_mesh.translate(np.array(drone.pos) - 0.5)
-        vis.add_geometry(drone_mesh)
+        drone_mesh = pv.Cube(center=drone.pos, x_length=1, y_length=1, z_length=1)
+        pl.add_mesh(drone_mesh, color="#f011b6")
 
-    _camera(vis)
+        start_pos = np.argwhere(values == 5)
+        if len(start_pos):
+            s = pv.Sphere(center=start_pos[0].astype(float), radius=1.2)
+            pl.add_mesh(s, color="#00d20e")
+
+        end_pos = np.argwhere(values == 4)
+        if len(end_pos):
+            e = pv.Sphere(center=end_pos[0].astype(float), radius=1.2)
+            pl.add_mesh(e, color="#ff0000")
+
+        lookat = np.array(drone.pos, dtype=float)
+        pl.camera_position = [
+            lookat + [50, -30, 40],
+            lookat,
+            [0, 0, 1],
+        ]
 
     if drone is None:
-        vis.run()
-        vis.destroy_window()
+        pl.show()
         return None, None
 
-    return vis, drone_mesh
+    return pl, drone_mesh
 
 
 def main():
     generate_terrain()
-    generate_trees()
-    start, end = generate_start_and_end()
+    #generate_trees()
+    cave_gen.gen_caves(                                                           
+        values, 
+        ground_level, 
+        seed, 
+        density=cave_density, 
+        room_sz=cave_room_size
+    )
+
+    cave_positions = _find_cave_positions()
+
+    if len(cave_positions) >= 2:
+        random.shuffle(cave_positions)
+        start = cave_positions[0]
+        dists = [np.linalg.norm(np.array(p) - np.array(start)) for p in cave_positions]
+        end = cave_positions[int(np.argmax(dists))]
+    else:
+        print("WARNING: no tunnel voxels found, falling back to surface start/end")
+        start, end = generate_start_and_end()
+
     replace_within_clearance(start[0], start[1], start[2], 2, 0)
     replace_within_clearance(end[0], end[1], end[2], 2, 0)
-    points = generate_points(start, end, 20, 30, 80)
-    spline_to_grid(points)
     print(f"Start: {start}, End: {end}")
 
     drone = Drone(id=0, sight_range=10, values=values, pos=start, goal=end)
-    vis, drone_mesh = show_grid(drone)
+    pl, drone_mesh = show_grid(drone)
     assert drone_mesh is not None
 
     prev_pos = drone.pos.copy()
     step_count = [0]
 
-    def step(vis):
-        if step_count[0] >= 1000:
-            vis.close()
-            return True
+    pl.show(interactive_update=True)
+    while step_count[0] < 1000:
         direction = np.random.uniform(-1, 1, size=3)
         drone.move(direction, amount=1)
-        drone_mesh.translate(drone.pos - prev_pos)
-        vis.update_geometry(drone_mesh)
+        drone_mesh.translate(drone.pos - prev_pos, inplace=True)
         prev_pos[:] = drone.pos
         step_count[0] += 1
-        return False
+        pl.update()
+        time.sleep(0.03)
 
-    vis.register_animation_callback(step)
-    vis.run()
+    pl.close()
 
 
 if __name__ == "__main__":

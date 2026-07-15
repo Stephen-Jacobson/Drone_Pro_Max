@@ -14,9 +14,11 @@ import random
 
 def carve_sphere(values, cx, cy, cz, radius, cave_val):
     gx, gy, gz = values.shape
+
     x0, x1 = max(0, int(cx - radius)), min(gx, int(cx + radius + 1))
     y0, y1 = max(0, int(cy - radius)), min(gy, int(cy + radius + 1))
     z0, z1 = max(0, int(cz - radius)), min(gz, int(cz + radius + 1))
+
     for ix in range(x0, x1):
         for iy in range(y0, y1):
             for iz in range(z0, z1):
@@ -39,11 +41,11 @@ def gen_caves(values, ground_lvl, seed, cave_val=0, **kwargs):
     rng = random.Random(seed)
 
     tunnel_network_params = TunnelNetworkParams(
-        collision_distance=6,
-        max_inclination_rad=np.deg2rad(30),
-        min_intersection_angle_rad=np.deg2rad(30),
-        min_distance_between_intersections=20,
-        flat=False,
+        collision_distance = 6,
+        max_inclination_rad = np.deg2rad(30),
+        min_intersection_angle_rad = np.deg2rad(30),
+        min_distance_between_intersections = 20,
+        flat = False,
     )
     tunnel_network = TunnelNetwork(params=tunnel_network_params, initial_node=False)
 
@@ -51,28 +53,29 @@ def gen_caves(values, ground_lvl, seed, cave_val=0, **kwargs):
     n_connectors = rng.randint(0, 2)
 
     for _ in range(n_tunnels):
-        length = rng.uniform(40, 80)
+        length = rng.uniform(400, 400)
         h_tend = rng.uniform(-30, 30)
         v_tend = rng.uniform(-10, 10)
-        h_noise = rng.uniform(5, 15)
-        v_noise = rng.uniform(3, 8)
-        min_seg = rng.uniform(5, 10)
+        h_noise = rng.uniform(5, 2)
+        v_noise = rng.uniform(2, 1)
+        min_seg = rng.uniform(3, 2)
         max_seg = rng.uniform(10, 20)
 
         params = GrownTunnelGenerationParams(
-            distance=length,
-            horizontal_tendency_rad=np.deg2rad(h_tend),
-            vertical_tendency_rad=np.deg2rad(v_tend),
-            horizontal_noise_rad=np.deg2rad(h_noise),
-            vertical_noise_rad=np.deg2rad(v_noise),
-            min_segment_length=min_seg,
-            max_segment_length=max_seg,
+            distance = length,
+            horizontal_tendency_rad = np.deg2rad(h_tend),
+            vertical_tendency_rad = np.deg2rad(v_tend),
+            horizontal_noise_rad = np.deg2rad(h_noise),
+            vertical_noise_rad = np.deg2rad(v_noise),
+            min_segment_length = min_seg,
+            max_segment_length = max_seg,
         )
         success, tunnel = tunnel_network.add_random_grown_tunnel(
             params=params,
             n_trials=50,
             yaw_range=(0, 2 * np.pi),
         )
+
         if not success:
             continue
 
@@ -99,6 +102,7 @@ def gen_caves(values, ground_lvl, seed, cave_val=0, **kwargs):
             if np.any(ground_lvl > 0)
             else gz // 2
         )
+
         spline = tunnel.spline
         _, aps, _ = spline.discretize(0.5)
 
@@ -107,6 +111,10 @@ def gen_caves(values, ground_lvl, seed, cave_val=0, **kwargs):
         positions += offset
 
         for pos in positions:
-            carve_sphere(values, pos[0], pos[1], pos[2], radius, cave_val)
+            ix, iy = int(round(pos[0])),int(round(pos[1]))
+            if 0 <= ix < gx and 0 <= iy < gy:
+                local_ground = ground_lvl[ix, iy]
+                cz = local_ground - radius - 1 # put the entire sphere below surface
+                carve_sphere(values, pos[0], pos[1], cz, radius, cave_val)
 
     return values
