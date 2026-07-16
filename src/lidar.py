@@ -47,7 +47,9 @@ def cast_all_rays(values, origin, directions, max_range, thickness=1):
             (y >= 0) & (y < values.shape[1]) &
             (z >= 0) & (z < values.shape[2])
         )
-        active[ai[~in_bounds]] = False
+        oob = ai[~in_bounds]
+        distances[oob] = np.linalg.norm(xyz[oob] - origin, axis=1)  # treat edge-of-grid as a wall
+        active[oob] = False
 
         ib = ai[in_bounds]
         if not len(ib):
