@@ -3,7 +3,7 @@ name = "drone-pro-max"
 version = "0.3.0"
 description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.14"
+requires-python = ">=3.11,<3.13"
 dependencies = [
     "gymnasium>=1.2.3",
     "mavsdk>=3.15.3",
@@ -17,4 +17,6 @@ dependencies = [
     "scipy>=1.17.1",
     "torchrl>=0.13.2",
     "tqdm>=4.68.3",
+    "open3d>=0.19.0",
+    "cupy-cuda12x>=14.1.1",
 ]
