@@ -2,6 +2,7 @@ from collections import deque
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from tensordict import TensorDict
 from torchrl.data import Bounded, Composite, Unbounded
 from torchrl.envs import EnvBase
@@ -15,6 +16,15 @@ GOAL_RADIUS = 5.0
 
 
 class DroneEnv(EnvBase):
+    @staticmethod
+    def _stride2_conv_out(n, kernel=3, stride=2, padding=1):
+        """Output size of a single Conv2d(kernel=3, stride=2, padding=1)
+        applied to an `n`-long spatial dimension -- matches the two
+        stride-2 conv layers the old CNN used to downsample coverage_map
+        with, so the new precomputed downscaled map ends up the same size
+        the network used to see after the conv stack."""
+        return (n + 2 * padding - kernel) // stride + 1
+
     def __init__(self, values, start, end, n_rays=100, sight_range=10, spray_n_rays=50, max_steps=400, prob4=0.8,
                  region_done_threshold=None):
         super().__init__()
@@ -94,22 +104,36 @@ class DroneEnv(EnvBase):
 
         # flat obs = lidar scan + goal direction(3)+distance(1)
         #
-        # CHANGED: active-region direction(3)+distance(1) and next-region
-        # direction(3)+distance(1) used to live here too, but now that
-        # coverage_map carries an explicit drone-position channel (channel
-        # 2, alongside the active-region material in channel 0), the CNN
-        # has everything it needs to work out direction/distance to the
-        # active or next region itself -- both are spatial info already on
-        # the map. Keeping the hand-computed vectors around too would just
-        # be redundant, hand-fed navigation the network no longer needs.
+        # CHANGED: coverage_map is no longer fed through a CNN (see
+        # _build_coverage_map below) -- it's now two precomputed, already-
+        # downscaled channels: channel 0 is the active-region spray-need
+        # map, channel 1 is the drone's position (a soft one-hot spike,
+        # downscaled the same way as channel 0). Since the position channel
+        # now puts the drone directly on the same grid as what needs
+        # spraying, there's no separate hand-computed direction/distance to
+        # the active region in `flat` anymore -- the map alone is meant to
+        # carry that relationship, for the network to learn to read off
+        # itself instead of being handed it as a shortcut.
         flat_size = n_rays + 4
         map_h, map_w = self.spray_tracker.shape  # (x, y) footprint of the terrain
 
+        # --- NEW: matches the spatial size the old CNN's two stride-2,
+        # kernel-3, padding-1 conv layers reduced the map down to
+        # internally, so the downscaled map below carries the same amount
+        # of spatial detail the network used to end up working with anyway
+        # -- just computed directly instead of learned.
+        self._map_out_hw = (
+            self._stride2_conv_out(self._stride2_conv_out(map_h)),
+            self._stride2_conv_out(self._stride2_conv_out(map_w)),
+        )
+
         # --- CHANGED: observation_spec is now a Composite with two keys,
-        # not a single flat "observation" key. This is what the CNN's
-        # in_keys=["coverage_map", "flat"] on actor_net/value_net expect.
+        # not a single flat "observation" key. This is what the actor/value
+        # net's in_keys=["coverage_map", "flat"] expect. coverage_map is now
+        # a 2-channel downscaled map (see _build_coverage_map) instead
+        # of the old 3-channel full-resolution map a CNN used to chew on.
         self.observation_spec = Composite(
-            coverage_map=Unbounded(shape=(3, map_h, map_w)),   # channel 0: material, channel 1: completion, channel 2: drone position
+            coverage_map=Unbounded(shape=(2, *self._map_out_hw)),  # channel 0: active-region spray-need, channel 1: drone position -- both downscaled
             flat=Unbounded(shape=(flat_size,)),
             # NEW: explicit crash flag, separate from "done" (which also fires on
             # successful completion). Not consumed by the CNN (in_keys=["coverage_map",
@@ -239,11 +263,6 @@ class DroneEnv(EnvBase):
         )
         direction, distance = lidar.get_goal_vector(self.drone.pos, self.end, self.sight_range)
 
-        # CHANGED: active-region and next-region direction/distance used to
-        # be computed and appended here too (see the flat_size comment in
-        # __init__) -- dropped now that coverage_map's drone-position
-        # channel gives the CNN the same information spatially, without a
-        # hand-scripted vector pointing it at a fixed centroid.
         flat = np.concatenate([
             self._last_scan, direction, [distance],
         ]).astype(np.float32)
@@ -286,49 +305,69 @@ class DroneEnv(EnvBase):
         return bool(labels[x, y] == region_id)
 
     def _build_coverage_map(self):
-        """(3, H, W) tensor: channel 0 = region material (1.0 needs-water,
-        0.5 no-water, 0.0 path/other), channel 1 = completion fraction
-        (hit_counts / required_hits_per_cell, clipped to [0, 1]), channel 2
-        = drone position -- a single 1.0 at the drone's current (x, y) cell,
-        0 everywhere else.
+        """(2, h_out, w_out) tensor: two channels, each downscaled/averaged
+        from the full (H, W) footprint down to h_out x w_out -- the same
+        spatial size the old CNN used to reduce the map to internally via
+        its two stride-2 conv layers (see _stride2_conv_out / self._map_out_hw).
 
-        Channel 2 is what lets the CNN itself work out where the drone
-        sits relative to the active region (channel 0) instead of relying
-        on a separately-computed direction/distance feature -- see the
-        active/next-region vectors that used to live in `flat`, now
-        removed since this makes them redundant.
+        Channel 0 -- "how much does this active-region cell still need
+        spraying". Per full-resolution cell, before downscaling:
+          - 0.0  outside the active region entirely (any other region, or
+                 no active region at all)
+          - 0.0  inside the active region but already fully sprayed
+                 (completeness >= 1) -- done cells stop mattering, same as
+                 cells outside the region
+          - fraction in (0, 1]  inside the active region and not yet fully
+                 sprayed: 1.0 - completeness, i.e. how much spraying is
+                 still needed there (1.0 = untouched, near 0 = nearly done)
+
+        Channel 1 -- drone position. A single 1.0 at the drone's current
+        (x, y) cell, 0 everywhere else, BEFORE downscaling -- i.e. a soft
+        one-hot spike once pooled, since averaging spreads that single 1.0
+        across however many full-res cells land in its output bin (so its
+        peak value shrinks the coarser h_out/w_out is, but it stays the
+        only nonzero region on the map). This puts the drone directly on
+        the same grid as what needs spraying, so the network can read the
+        relationship off the map itself instead of being handed a
+        hand-computed direction/distance vector in `flat`.
+
+        The downscaling itself is average pooling (torch's
+        adaptive_avg_pool2d), which does exactly what plain reshaping
+        can't when the map size doesn't divide evenly into h_out/w_out:
+        it splits the input into h_out x w_out roughly-equal blocks and
+        averages each one, so a block straddling both 0s and partial
+        fractions (or straddling the position spike) comes out as their
+        true mean rather than being rounded or truncated.
         """
         st = self.spray_tracker
-        mat_channel = np.zeros(st.shape, dtype=np.float32)
-        # NEW: needs-water regions still waiting in the queue read lower
-        # (0.6) than the one actively being worked (1.0), so the CNN can see
-        # which single region it should be focused on right now.
-        for rid in st.needs_water_regions:
-            mat_channel[st.labels == rid] = 0.6
-        if self.active_region_id is not None:
-            mat_channel[st.labels == self.active_region_id] = 1.0
-        for rid in st.no_water_regions:
-            mat_channel[st.labels == rid] = 0.3
-
-        comp_channel = np.clip(
+        completeness = np.clip(
             st.hit_counts / max(st.required_hits_per_cell, 1), 0.0, 1.0
         ).astype(np.float32)
+        remaining_need = 1.0 - completeness
 
-        # NEW: position channel. Drone position is a float (self.drone.pos
-        # can sit mid-cell) so this clamps/rounds to the nearest valid cell
-        # rather than assuming int(pos) is always safe to index.
+        need_channel = np.zeros(st.shape, dtype=np.float32)
+        if self.active_region_id is not None:
+            active_mask = (st.labels == self.active_region_id)
+            need_channel[active_mask] = remaining_need[active_mask]
+
+        # Drone position is a float (self.drone.pos can sit mid-cell) so
+        # this clamps/rounds to the nearest valid cell rather than assuming
+        # int(pos) is always safe to index.
         pos_channel = np.zeros(st.shape, dtype=np.float32)
         px = int(np.clip(round(float(self.drone.pos[0])), 0, st.shape[0] - 1))
         py = int(np.clip(round(float(self.drone.pos[1])), 0, st.shape[1] - 1))
         pos_channel[px, py] = 1.0
 
-        return np.stack([mat_channel, comp_channel, pos_channel], axis=0)
+        # (2, H, W) -> average-pool down to (2, h_out, w_out), each channel independently
+        t = torch.from_numpy(np.stack([need_channel, pos_channel], axis=0)).unsqueeze(0)
+        downscaled = F.adaptive_avg_pool2d(t, output_size=self._map_out_hw)
+        return downscaled.squeeze(0).numpy()
 
     # --- reward tuning constants -- all in one place so they're easy to find/adjust ---
     CRASH_PENALTY = -8                 # hitting terrain/trees/out-of-bounds
     STEP_COST = 0.1                    # tiny per-step cost, discourages stalling
     OVERSPRAY_PENALTY_PER_HIT = 0.00     # per spray-ray hit landed on a no-water region
-    SPRAY_HIT_REWARD_PER_HIT = 0.8     # per spray-ray hit landed on a needs-water region (up to its cap)
+    SPRAY_HIT_REWARD_PER_HIT = 0.01     # per spray-ray hit landed on a needs-water region (up to its cap)
     PROGRESS_REWARD_SCALE = 0.0           # multiplier on step-to-step completeness delta
     REGION_COMPLETE_BONUS = 12.0          # one-time bonus, paid the step the ACTIVE (pink-line-targeted) region finishes
     OFF_TARGET_REGION_COMPLETE_BONUS = 6.0  # one-time bonus/penalty, paid the step a NON-active region finishes -- paid immediately, same step it crosses threshold, NOT deferred to whenever it later becomes active. Set >0 for partial credit, <0 to penalize wandering off-task, or leave at 0 (default) to only reward finishing the region it's pointed at.

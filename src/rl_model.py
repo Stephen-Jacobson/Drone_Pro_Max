@@ -53,7 +53,7 @@ if __name__ == "__main__":
     print(f"training on {device}")
     
     steps_per_batch = 1600          # how many moves will make before model learns from it, so model isnt updating until steps_per_batch moves have been done, 1 step = 1 move
-    total_steps = 1_000_000            # how many total steps until done training
+    total_steps = 500_000            # how many total steps until done training
     #therefore if 1000 steps in batch and 50000 steps total, will learn 50000/1000 = 50 times
 
     # --- REGION_DONE_THRESHOLD staircase curriculum, spread evenly across total_steps ---
@@ -150,18 +150,18 @@ if __name__ == "__main__":
     #     NormalParamExtractor(),
     # )
 
-    class CNNActorNet(nn.Module):
-        def __init__(self, num_cells, action_dim, map_channels=3, device=None):
+    class MapActorNet(nn.Module):
+        """CHANGED: coverage_map is now precomputed and already downscaled
+        by DroneEnv._build_coverage_map() (average-pooled down to the same
+        spatial size the old CNN used to reduce it to internally) -- so
+        there's no more spatial pattern left for a conv stack to learn to
+        detect. It's just flattened and passed through a linear layer,
+        exactly like the flat branch."""
+        def __init__(self, num_cells, action_dim, device=None):
             super().__init__()
 
-            self.cnn = nn.Sequential(
-                nn.LazyConv2d(16, kernel_size=3, stride=1, padding=1, device=device),
-                nn.ReLU(),
-                nn.LazyConv2d(32, kernel_size=3, stride=2, padding=1, device=device),
-                nn.ReLU(),
-                nn.LazyConv2d(32, kernel_size=3, stride=2, padding=1, device=device),
-                nn.ReLU(),
-                nn.Flatten(),
+            self.map_branch = nn.Sequential(
+                nn.Flatten(start_dim=-3),
                 nn.LazyLinear(num_cells, device=device),
                 nn.ReLU(),
             )
@@ -188,17 +188,13 @@ if __name__ == "__main__":
             self.extractor = NormalParamExtractor()
 
         def forward(self, coverage_map, flat):
-            batch_shape = coverage_map.shape[:-3]
-            coverage_map_flat = coverage_map.reshape(-1, *coverage_map.shape[-3:])
-            map_feat = self.cnn(coverage_map_flat)
-            map_feat = map_feat.reshape(*batch_shape, -1)
-
+            map_feat = self.map_branch(coverage_map)
             flat_feat = self.flat_branch(flat)
             fused = torch.cat([map_feat, flat_feat], dim=-1)
             out = self.trunk(fused)
             return self.extractor(out)
 
-    actor_net = CNNActorNet(num_cells=num_cells, action_dim=env.action_spec.shape[-1], device=device)
+    actor_net = MapActorNet(num_cells=num_cells, action_dim=env.action_spec.shape[-1], device=device)
 
     
     policy_module = TensorDictModule(
@@ -228,18 +224,12 @@ if __name__ == "__main__":
     #     nn.LazyLinear(1, device=device),
     # )
 
-    class CNNValueNet(nn.Module):
-        def __init__(self, num_cells, map_channels=3, device=None):
+    class MapValueNet(nn.Module):
+        def __init__(self, num_cells, device=None):
             super().__init__()
 
-            self.cnn = nn.Sequential(
-                nn.LazyConv2d(16, kernel_size=3, stride=1, padding=1, device=device),
-                nn.ReLU(),
-                nn.LazyConv2d(32, kernel_size=3, stride=2, padding=1, device=device),
-                nn.ReLU(),
-                nn.LazyConv2d(32, kernel_size=3, stride=2, padding=1, device=device),
-                nn.ReLU(),
-                nn.Flatten(),
+            self.map_branch = nn.Sequential(
+                nn.Flatten(start_dim=-3),
                 nn.LazyLinear(num_cells, device=device),
                 nn.ReLU(),
             )
@@ -266,17 +256,13 @@ if __name__ == "__main__":
             self.extractor = NormalParamExtractor()
 
         def forward(self, coverage_map, flat):
-            batch_shape = coverage_map.shape[:-3]
-            coverage_map_flat = coverage_map.reshape(-1, *coverage_map.shape[-3:])
-            map_feat = self.cnn(coverage_map_flat)
-            map_feat = map_feat.reshape(*batch_shape, -1)
-
+            map_feat = self.map_branch(coverage_map)
             flat_feat = self.flat_branch(flat)
             fused = torch.cat([map_feat, flat_feat], dim=-1)
             out = self.trunk(fused)
             return out
-        
-    value_net = CNNValueNet(num_cells=num_cells, device=device)
+
+    value_net = MapValueNet(num_cells=num_cells, device=device)
     
     value_module = ValueOperator(
         module=value_net,
