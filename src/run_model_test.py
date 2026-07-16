@@ -3,7 +3,6 @@ import os
 os.environ["__NV_PRIME_RENDER_OFFLOAD"] = "1"
 os.environ["__GLX_VENDOR_LIBRARY_NAME"] = "nvidia"
 
-import time
 import torch
 from torch import nn
 import numpy as np
@@ -120,36 +119,40 @@ def main():
     print(f"Rollout finished — {len(path_history)} positions recorded.")
 
     # ── live animated visualisation ───────────────────────────────────────────
+    # reset drone voxel to start position for the visualiser
     sim.values[int(env.drone.pos[0]), int(env.drone.pos[1]), int(env.drone.pos[2])] = 0
     sim.values[int(start[0]), int(start[1]), int(start[2])] = 5
 
+    # create a temporary drone object positioned at start for show_grid
     vis_drone = Drone(0, 10, sim.values, start, end)
-    pl, drone_mesh = sim.show_grid(vis_drone)
+    vis, drone_mesh = sim.show_grid(vis_drone)
     assert drone_mesh is not None
 
     step_index = [0]
-    prev_pos = np.array(start, dtype=np.float32)
+    prev_pos = [np.array(start, dtype=np.float32)]
 
-    pl.show(interactive_update=True)
-    while step_index[0] < len(path_history):
-        new_pos = path_history[step_index[0]].astype(np.float32)
-        delta = new_pos - prev_pos
-        drone_mesh.translate(delta, inplace=True)
-        prev_pos = new_pos
+    def advance(vis):
+        i = step_index[0]
+        if i >= len(path_history):
+            vis.close()
+            return True
+
+        new_pos = path_history[i].astype(np.float32)
+        delta = new_pos - prev_pos[0]
+        drone_mesh.translate(delta)
+        vis.update_geometry(drone_mesh)
+        prev_pos[0] = new_pos
         step_index[0] += 1
 
         if FOLLOW:
-            lookat = prev_pos
-            pl.camera_position = [
-                lookat + [50, -30, 40],
-                lookat,
-                [0, 0, 1],
-            ]
+            ctrl = vis.get_view_control()
+            lookat = np.asarray(ctrl.get_lookat()) + delta
+            ctrl.set_lookat(lookat)
 
-        pl.update()
-        time.sleep(0.03)
+        return False
 
-    pl.close()
+    vis.register_animation_callback(advance)
+    vis.run()
 
 
 if __name__ == "__main__":
