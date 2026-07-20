@@ -1,6 +1,7 @@
 # TODO: create model in here to be used by drone
 import os
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+import numpy as np
 import torch
 from torch import nn
 from torch import multiprocessing
@@ -34,10 +35,11 @@ import math
 
 from drone_env import DroneEnv
 import open3d_sim_env as sim
+import pick_block
  
 MAX_STEPS = 400
 VISUALISE = False
-CHECKPOINT_PATH = os.path.join(os.path.dirname(__file__), "..", "pax_v2_3.pt")
+CHECKPOINT_PATH = os.path.join(os.path.dirname(__file__), "..", "pax_v2_5.pt")
 
 if __name__ == "__main__":
     is_fork = multiprocessing.get_start_method() == "fork"
@@ -46,14 +48,14 @@ if __name__ == "__main__":
         if torch.cuda.is_available() and not is_fork
         else torch.device("cpu")
     )                               # decides if torch will go on gpu or cpu, gpu better
-    num_cells = 512                  # cells per hidden layer
+    num_cells = 256                  # cells per hidden layer
     lr = 3e-4
     max_grad_norm = 1.0             # prevents too violent actions early in training
     
     print(f"training on {device}")
     
     steps_per_batch = 1600          # how many moves will make before model learns from it, so model isnt updating until steps_per_batch moves have been done, 1 step = 1 move
-    total_steps = 500_000            # how many total steps until done training
+    total_steps = 5_000_000            # how many total steps until done training
     #therefore if 1000 steps in batch and 50000 steps total, will learn 50000/1000 = 50 times
 
     # --- REGION_DONE_THRESHOLD staircase curriculum, spread evenly across total_steps ---
@@ -61,8 +63,8 @@ if __name__ == "__main__":
     # stages; REGION_DONE_THRESHOLD jumps by one fixed increment at each
     # stage boundary (flat within a stage). All three are decided/changeable:
     REGION_DONE_THRESHOLD_START = 0.01      # threshold for stage 0 (start of training)
-    REGION_DONE_THRESHOLD_END = 0.50        # threshold for the final stage
-    REGION_DONE_THRESHOLD_INTERVALS = 8     # number of stepped stages spanning total_steps
+    REGION_DONE_THRESHOLD_END = 0.90        # threshold for the final stage
+    REGION_DONE_THRESHOLD_INTERVALS = 20     # number of stepped stages spanning total_steps
     
     # PPO Parameters (Proximal Policy Optimization)
         # At each steps_per_batch we will run to optimise model, this is done by taking a sub batch size, eg 64,
@@ -151,19 +153,45 @@ if __name__ == "__main__":
     # )
 
     class MapActorNet(nn.Module):
-        """CHANGED: coverage_map is now precomputed and already downscaled
-        by DroneEnv._build_coverage_map() (average-pooled down to the same
-        spatial size the old CNN used to reduce it to internally) -- so
-        there's no more spatial pattern left for a conv stack to learn to
-        detect. It's just flattened and passed through a linear layer,
-        exactly like the flat branch."""
+        """CHANGED: there's no more `map_feat` embedding of coverage_map fed
+        into the trunk. Instead, coverage_map's channel 0 (downscaled
+        spray-need density -- see DroneEnv._build_coverage_map) is used to
+        pick a t in [0, 1] via density_direction, and pick_block.pick_block()
+        resolves that t into a concrete block. That block's (direction,
+        distance) -- `block_loc` -- is what actually feeds the trunk,
+        concatenated with flat_feat. map_feat is gone entirely; block_loc
+        is its replacement as an RL input.
+
+        NEW: pick_block resolves its block against density_map_full/
+        drone_xy -- DroneEnv's REAL full-resolution grid (e.g. 30x30) and
+        the drone's real (x, y) -- not the coarse downscaled coverage_map
+        channels. density_direction still reads the downscaled channel 0
+        to decide t (that's the network's actual learned input); only the
+        grid pick_block *resolves against* changed. These two keys travel
+        through the tensordict/replay buffer as their own observations
+        (see DroneEnv.observation_spec), so each step -- whether it's a
+        live one from a parallel env or a historical one replayed during a
+        PPO update -- carries its own correct full-res state, unlike
+        reaching for "the current env", which wouldn't make sense here
+        with 16 parallel envs and replayed historical steps.
+        """
         def __init__(self, num_cells, action_dim, device=None):
             super().__init__()
 
-            self.map_branch = nn.Sequential(
-                nn.Flatten(start_dim=-3),
-                nn.LazyLinear(num_cells, device=device),
+            self.density_direction = nn.Sequential(
+                nn.Conv2d(1, 16, 3, padding=1, device=device),
                 nn.ReLU(),
+
+                nn.Conv2d(16, 32, 3, padding=1, device=device),
+                nn.ReLU(),
+
+                nn.Flatten(),
+
+                nn.LazyLinear(64, device=device),
+                nn.ReLU(),
+
+                nn.Linear(64, 1, device=device),
+                nn.Sigmoid(),
             )
 
             self.flat_branch = nn.Sequential(
@@ -187,10 +215,54 @@ if __name__ == "__main__":
 
             self.extractor = NormalParamExtractor()
 
-        def forward(self, coverage_map, flat):
-            map_feat = self.map_branch(coverage_map)
+        def _block_loc_batch(self, density_full_batch, drone_xy_batch, t_batch):
+            """density_full_batch: (N, H, W) tensor -- DroneEnv's REAL
+            full-resolution active-region need map (density_map_full),
+            flattened over any leading batch dims. drone_xy_batch: (N, 2)
+            tensor -- the drone's real (x, y) for each of those N steps.
+            t_batch: (N, 1) tensor in [0, 1] from density_direction.
+
+            Returns an (N, 3) tensor of [direction_x, direction_y,
+            distance] -- pick_block.pick_block() works on raw numpy
+            grids/positions, not batched torch tensors, so this loops
+            per-sample.
+            """
+            density_np = density_full_batch.detach().cpu().numpy()
+            pos_np = drone_xy_batch.detach().cpu().numpy()
+            t_np = t_batch.detach().cpu().numpy().reshape(-1)
+
+            rows = []
+            for i in range(density_np.shape[0]):
+                result = pick_block.pick_block(density_np[i], pos_np[i], float(t_np[i]))
+                if result is None:
+                    rows.append(np.array([0.0, 0.0, 1.0], dtype=np.float32))
+                else:
+                    direction, distance = result["direction"], result["distance"]
+                    rows.append(np.array([direction[0], direction[1], distance], dtype=np.float32))
+
+            return torch.tensor(np.stack(rows), dtype=torch.float32, device=density_full_batch.device)
+
+        def forward(self, coverage_map, flat, density_map_full, drone_xy):
+            # coverage_map: (*batch, 2, H, W) -- channel 0 = spray-need
+            # density (downscaled), channel 1 = drone position (downscaled,
+            # unused here -- drone_xy below is the real position instead).
+            density_channel = coverage_map[..., 0, :, :]
+
+            batch_shape = density_channel.shape[:-2]
+            density_flat = density_channel.reshape(-1, *density_channel.shape[-2:])
+
+            # density_map_full/drone_xy carry the same leading batch dims
+            # as coverage_map/flat -- flatten them the same way so rows
+            # line up 1:1 with density_flat/t below.
+            density_full_flat = density_map_full.reshape(-1, *density_map_full.shape[-2:])
+            drone_xy_flat = drone_xy.reshape(-1, drone_xy.shape[-1])
+
+            chosen_t = self.density_direction(density_flat.unsqueeze(1))  # (N, 1)
+            block_loc = self._block_loc_batch(density_full_flat, drone_xy_flat, chosen_t)  # (N, 3)
+            block_loc = block_loc.reshape(*batch_shape, 3)
+
             flat_feat = self.flat_branch(flat)
-            fused = torch.cat([map_feat, flat_feat], dim=-1)
+            fused = torch.cat([flat_feat, block_loc], dim=-1)
             out = self.trunk(fused)
             return self.extractor(out)
 
@@ -198,7 +270,7 @@ if __name__ == "__main__":
 
     
     policy_module = TensorDictModule(
-        actor_net, in_keys=["coverage_map", "flat"], out_keys=["loc", "scale"]
+        actor_net, in_keys=["coverage_map", "flat", "density_map_full", "drone_xy"], out_keys=["loc", "scale"]
     ) 
     
     policy_module = ProbabilisticActor(
@@ -368,7 +440,7 @@ if __name__ == "__main__":
                     td_vis = vis_env._step(td_vis)
                     if td_vis["done"].item():
                         break
-                    td_vis = td_vis.select("coverage_map", "flat")
+                    td_vis = td_vis.select("coverage_map", "flat", "density_map_full", "drone_xy")
             path_copy = vis_env.path_history.copy()
             threading.Thread(target=sim.show_path, args=(path_copy, clean_grid.copy()), daemon=True).start()
     

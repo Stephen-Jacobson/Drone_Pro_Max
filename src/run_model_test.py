@@ -18,12 +18,13 @@ from torchrl.data import Bounded
 import open3d_sim_env as sim
 from drone_env import DroneEnv
 from drone import Drone
+import pick_block
 
 MAX_STEPS = 400
-num_cells = 512          # must match rl_model.py
-CHECKPOINT_PATH = os.path.join(os.path.dirname(__file__), "..", "pax_v2_3.pt")
+num_cells = 256          # must match rl_model.py
+CHECKPOINT_PATH = os.path.join(os.path.dirname(__file__), "..", "pax_v2_5.pt")
 FRAMES_PER_STEP = 10      # adjust this to slow down: higher = slower (1=normal speed)
-TEST_REGION_DONE_THRESHOLD = 0.50
+TEST_REGION_DONE_THRESHOLD = 0.90
 
 
 # ── rebuild model architecture (must match rl_model.py exactly) ──────────────
@@ -31,18 +32,38 @@ TEST_REGION_DONE_THRESHOLD = 0.50
 # trained architecture exactly, or load_state_dict will fail / silently
 # load into the wrong shapes.
 #
-# CHANGED: coverage_map is now precomputed and already downscaled by
-# DroneEnv._build_coverage_map() (average-pooled down to the size the old
-# CNN used to reduce it to internally) -- so there's no more conv stack
-# here, just a flatten + linear, same as rl_model.py.
+# CHANGED: no more `map_feat` embedding of coverage_map fed into the trunk.
+# Instead, coverage_map's channel 0 (downscaled spray-need density) is used
+# to pick a t in [0, 1] via density_direction, and pick_block.pick_block()
+# resolves that t into a concrete block. That block's (direction, distance)
+# -- `block_loc` -- is what actually feeds the trunk, concatenated with
+# flat_feat.
+#
+# NEW: pick_block resolves its block against density_map_full/drone_xy --
+# DroneEnv's REAL full-resolution grid (e.g. 30x30) and the drone's real
+# (x, y) -- not the coarse downscaled coverage_map channels. Both travel
+# through the tensordict as their own observation keys (see
+# DroneEnv.observation_spec), same as rl_model.py -- so block_rc coming out
+# of pick_block is already a world (x, y) cell, no separate rescaling
+# needed for the pink pointer line.
 class MapActorNet(nn.Module):
     def __init__(self, num_cells, action_dim, device=None):
         super().__init__()
 
-        self.map_branch = nn.Sequential(
-            nn.Flatten(start_dim=-3),
-            nn.LazyLinear(num_cells, device=device),
+        self.density_direction = nn.Sequential(
+            nn.Conv2d(1, 16, 3, padding=1, device=device),
             nn.ReLU(),
+
+            nn.Conv2d(16, 32, 3, padding=1, device=device),
+            nn.ReLU(),
+
+            nn.Flatten(),
+
+            nn.LazyLinear(64, device=device),
+            nn.ReLU(),
+
+            nn.Linear(64, 1, device=device),
+            nn.Sigmoid(),
         )
 
         self.flat_branch = nn.Sequential(
@@ -66,10 +87,90 @@ class MapActorNet(nn.Module):
 
         self.extractor = NormalParamExtractor()
 
-    def forward(self, coverage_map, flat):
-        map_feat = self.map_branch(coverage_map)
+        # NEW: world (x, y) of the block pick_block() picked on the most
+        # recent forward() call, or None if nothing valid was picked. This
+        # is what the pink line now points to, instead of the old
+        # active-region centroid.
+        self.last_target_xy = None
+        self._last_picked_blocks = None
+
+    def _target_xy_from_block(self, block_rc):
+        """Convert a (row, col) picked by pick_block.pick_block() into a
+        world (x, y) point on the terrain. Since pick_block now operates
+        directly on the full-resolution density grid -- the same
+        coordinate system as the drone's world position -- block_rc
+        already IS the world cell; this just recenters it (+0.5, matching
+        the +0.5 cell-centre offset used elsewhere, e.g. make_drone_mesh /
+        path_points), with no rescaling needed.
+
+        Returns None if no block was picked.
+        """
+        if block_rc is None:
+            return None
+        row, col = block_rc
+        return np.array([float(row) + 0.5, float(col) + 0.5], dtype=np.float32)
+
+    def _block_loc_batch(self, density_full_batch, drone_xy_batch, t_batch):
+        """density_full_batch: (N, H, W) tensor -- DroneEnv's REAL
+        full-resolution active-region need map (density_map_full),
+        flattened over any leading batch dims. drone_xy_batch: (N, 2)
+        tensor -- the drone's real (x, y) for each of those N steps.
+        t_batch: (N, 1) tensor in [0, 1] from density_direction.
+
+        Returns an (N, 3) tensor of [direction_x, direction_y, distance]
+        -- pick_block.pick_block() works on raw numpy grids/positions, not
+        batched torch tensors, so this loops per-sample.
+        """
+        density_np = density_full_batch.detach().cpu().numpy()
+        pos_np = drone_xy_batch.detach().cpu().numpy()
+        t_np = t_batch.detach().cpu().numpy().reshape(-1)
+
+        rows = []
+        # NEW: (row, col) each sample's pick_block() call actually picked,
+        # or None -- lets forward() below convert sample 0's pick into a
+        # world-space target for the pink pointer line. run_model_test.py
+        # only ever runs the policy on a single env, so index 0 is "the"
+        # pick for whatever step is currently being visualised.
+        picked_blocks = []
+        for i in range(density_np.shape[0]):
+            result = pick_block.pick_block(density_np[i], pos_np[i], float(t_np[i]))
+            if result is None:
+                rows.append(np.array([0.0, 0.0, 1.0], dtype=np.float32))
+                picked_blocks.append(None)
+            else:
+                direction, distance = result["direction"], result["distance"]
+                rows.append(np.array([direction[0], direction[1], distance], dtype=np.float32))
+                picked_blocks.append(result["block"])
+
+        self._last_picked_blocks = picked_blocks
+        return torch.tensor(np.stack(rows), dtype=torch.float32, device=density_full_batch.device)
+
+    def forward(self, coverage_map, flat, density_map_full, drone_xy):
+        # coverage_map: (*batch, 2, H, W) -- channel 0 = spray-need
+        # density (downscaled), channel 1 = drone position (downscaled,
+        # unused here -- drone_xy below is the real position instead).
+        density_channel = coverage_map[..., 0, :, :]
+
+        batch_shape = density_channel.shape[:-2]
+        density_flat = density_channel.reshape(-1, *density_channel.shape[-2:])
+
+        # density_map_full/drone_xy carry the same leading batch dims as
+        # coverage_map/flat -- flatten them the same way so rows line up
+        # 1:1 with density_flat/t below.
+        density_full_flat = density_map_full.reshape(-1, *density_map_full.shape[-2:])
+        drone_xy_flat = drone_xy.reshape(-1, drone_xy.shape[-1])
+
+        chosen_t = self.density_direction(density_flat.unsqueeze(1))  # (N, 1)
+        block_loc = self._block_loc_batch(density_full_flat, drone_xy_flat, chosen_t)  # (N, 3)
+        block_loc = block_loc.reshape(*batch_shape, 3)
+
+        # NEW: remember sample 0's pick as a world (x, y) point, for the
+        # pink pointer line in run_model_test.py's visualisation.
+        picked = self._last_picked_blocks[0] if self._last_picked_blocks else None
+        self.last_target_xy = self._target_xy_from_block(picked)
+
         flat_feat = self.flat_branch(flat)
-        fused = torch.cat([map_feat, flat_feat], dim=-1)
+        fused = torch.cat([flat_feat, block_loc], dim=-1)
         out = self.trunk(fused)
         return self.extractor(out)
 
@@ -78,7 +179,7 @@ def build_policy(action_dim, device):
     actor_net = MapActorNet(num_cells=num_cells, action_dim=action_dim, device=device)
 
     policy_module = TensorDictModule(
-        actor_net, in_keys=["coverage_map", "flat"], out_keys=["loc", "scale"]
+        actor_net, in_keys=["coverage_map", "flat", "density_map_full", "drone_xy"], out_keys=["loc", "scale"]
     )
 
     action_spec = Bounded(low=-1, high=1, shape=(action_dim,))
@@ -126,6 +227,10 @@ def main():
     action_dim = env.action_spec.shape[-1]
     policy, actor_net = build_policy(action_dim, device)
 
+    # NOTE: no extra wiring needed here anymore -- density_map_full/drone_xy
+    # (DroneEnv's real full-resolution grid + drone position) travel through
+    # the tensordict as their own observation keys, same as coverage_map/flat.
+
     # warm up lazy layers so state_dict loads cleanly
     dummy = env.reset().to(device)
     with torch.no_grad():
@@ -149,6 +254,12 @@ def main():
     # anymore. Used to drive a live 2D viewer kept in lockstep with the 3D
     # playback below, no recomputation needed.
     coverage_history = [td["coverage_map"].cpu().numpy()]
+    # NEW: full-resolution active-region need map (e.g. 30x30) history --
+    # the REAL grid pick_block.pick_block() now chooses a target block
+    # from (see MapActorNet._block_loc_batch), as opposed to coverage_map's
+    # channel 0 above, which is the coarser downscaled version the network
+    # itself reads. Tracked separately so the live viewer can show both.
+    full_res_history = [env.full_res_active_need_map()]
     # NEW: which region is active, and its TRUE region-wide completeness
     # fraction (region_completeness()), at each step. coverage_history[i][0]
     # is scoped to the active region already (0 elsewhere), but it's still
@@ -163,17 +274,20 @@ def main():
     # whole episode -- safe to snapshot once here.
     region_labels = env.labels.copy()
     spray_history = []   # hit_xyz arrays, one per step, for the lineset animation
-    # NEW: active-region centroid at each step, for the pink pointer line
-    # showing where the drone is currently trying to go. None once every
-    # needs-water region has been finished (active_region_id goes to None).
-    def _active_target():
-        rid = env.active_region_id
-        return env.spray_tracker.region_centroid(rid) if rid is not None else None
-    target_history = [_active_target()]
     spray_steps = 0      # how many steps the policy actually chose to spray on
     total_reward = 0.0   # NEW: cumulative reward across the rollout
 
     with set_exploration_type(ExplorationType.DETERMINISTIC), torch.no_grad():
+        # NEW: the pink pointer line now points at whichever block
+        # pick_block.pick_block() actually picked from the model's own
+        # density/position input (MapActorNet.last_target_xy), not the
+        # active region's centroid. Run the policy once against the reset
+        # state purely to seed target_history[0] with that pick -- the loop
+        # below already calls policy(td) once per step for the real action,
+        # which is reused for target_history[step + 1].
+        policy(td.to(device))
+        target_history = [actor_net.last_target_xy]
+
         for step in range(MAX_STEPS):
             td = policy(td.to(device))
             action = td["action"].cpu().numpy()
@@ -186,13 +300,18 @@ def main():
             total_reward += reward
 
             coverage_history.append(td["coverage_map"].cpu().numpy())
+            full_res_history.append(env.full_res_active_need_map())
             active_id_history.append(env.active_region_id)
             active_completeness_history.append(
                 env.spray_tracker.region_completeness().get(env.active_region_id, 0.0)
                 if env.active_region_id is not None else None
             )
             path_history.append(env.drone.pos.copy())
-            target_history.append(_active_target())
+            # actor_net.last_target_xy was set by the policy(td) call above,
+            # which is what produced this step's action -- so it's still
+            # the right "this is what the model was aiming at" pick to pair
+            # with the position we just moved to.
+            target_history.append(actor_net.last_target_xy)
 
             # Re-fire spray purely for the visual lineset -- DroneEnv already
             # registered the real hits internally during _step(); this call
@@ -242,7 +361,7 @@ def main():
                       f"({total_reward / (step + 1):+.4f} avg/step)")
                 break
 
-            td = td.select("coverage_map", "flat").to(device)
+            td = td.select("coverage_map", "flat", "density_map_full", "drone_xy").to(device)
         else:
             # loop exhausted MAX_STEPS without the env ever reporting done
             # (e.g. MAX_STEPS set lower than env.max_steps) -- still report
@@ -261,8 +380,9 @@ def main():
     drone_mesh = sim.make_drone_mesh(vis_drone)
     spray_lineset = sim.make_spray_lineset(vis_drone.get_position(), np.zeros((0, 3)))
 
-    # --- NEW: pink pointer line from the drone to whichever region it's
-    # currently trying to reach (DroneEnv.active_region_id's centroid).
+    # --- NEW: pink pointer line from the drone to whichever block
+    # pick_block.pick_block() picked from the model's own density/position
+    # input this step (MapActorNet.last_target_xy), converted to world (x, y).
     target_lineset = sim.make_target_lineset(vis_drone.get_position(), target_history[0])
 
     # --- NEW: trail LineSet tracing the drone's flight path so far.
@@ -277,25 +397,33 @@ def main():
     PATH_COLOR = (0.1, 0.4, 1.0)  # blue, distinct from spray's green
 
     # ── live coverage-map viewer (matplotlib, separate window) ──────────────
-    # Two panels: channel 0, the downscaled active-region "spray-need" map
-    # (0 outside the active region or already fully sprayed there, fraction
-    # = how much spraying is still needed), and channel 1, the downscaled
-    # drone-position spike. Both are the exact arrays the policy reads --
-    # no CNN feature map to show anymore since coverage_map is precomputed/
-    # downscaled by DroneEnv itself rather than learned. Updated in
-    # lockstep with the 3D playback's advance() callback below.
+    # Three panels now: channel 0, the downscaled active-region "spray-need"
+    # map the network's density_direction head actually reads (0 outside
+    # the active region or already fully sprayed there, fraction = how
+    # much spraying is still needed); channel 1, the downscaled
+    # drone-position spike; and the REAL full-resolution density grid
+    # (e.g. 30x30) that pick_block.pick_block() now resolves its target
+    # block from (see MapActorNet._block_loc_batch) -- shown at its true
+    # resolution so it's clear the block choice is made on the real grid,
+    # not the coarse one the network sees. Updated in lockstep with the 3D
+    # playback's advance() callback below.
     plt.ion()
-    cov_fig, (cov_ax_need, cov_ax_pos) = plt.subplots(1, 2, figsize=(9, 4.5))
+    cov_fig, (cov_ax_need, cov_ax_pos, cov_ax_full) = plt.subplots(1, 3, figsize=(13.5, 4.5))
     cov_fig.canvas.manager.set_window_title("Coverage Map (live)")
 
     cov0 = coverage_history[0]
     im_need = cov_ax_need.imshow(cov0[0].T, origin="lower", cmap="viridis", vmin=0.0, vmax=1.0)
-    cov_ax_need.set_title("Active-region spray need")
+    cov_ax_need.set_title("Active-region spray need (downscaled)")
     cov_fig.colorbar(im_need, ax=cov_ax_need, fraction=0.046)
 
     im_pos = cov_ax_pos.imshow(cov0[1].T, origin="lower", cmap="viridis", vmin=0.0, vmax=cov0[1].max() or 1.0)
-    cov_ax_pos.set_title("Drone position")
+    cov_ax_pos.set_title("Drone position (downscaled)")
     cov_fig.colorbar(im_pos, ax=cov_ax_pos, fraction=0.046)
+
+    full0 = full_res_history[0]
+    im_full = cov_ax_full.imshow(full0.T, origin="lower", cmap="viridis", vmin=0.0, vmax=1.0)
+    cov_ax_full.set_title(f"Full-res spray need ({full0.shape[0]}x{full0.shape[1]})")
+    cov_fig.colorbar(im_full, ax=cov_ax_full, fraction=0.046)
 
     cov_suptitle = cov_fig.suptitle("step 0")
     cov_fig.tight_layout()
@@ -331,11 +459,17 @@ def main():
         cov_ax_need.clear()
         cov_ax_need.imshow(cov[0].T, origin="lower", cmap="viridis", vmin=0.0, vmax=1.0)
         comp_str = f"{comp_frac:.1%}" if comp_frac is not None else "no active region -- all done"
-        cov_ax_need.set_title(f"Active-region spray need (completeness: {comp_str})")
+        cov_ax_need.set_title(f"Active-region spray need (downscaled, completeness: {comp_str})")
 
         cov_ax_pos.clear()
         cov_ax_pos.imshow(cov[1].T, origin="lower", cmap="viridis", vmin=0.0, vmax=float(cov[1].max()) or 1.0)
-        cov_ax_pos.set_title("Drone position")
+        cov_ax_pos.set_title("Drone position (downscaled)")
+
+        if step_i < len(full_res_history):
+            full_map = full_res_history[step_i]
+            cov_ax_full.clear()
+            cov_ax_full.imshow(full_map.T, origin="lower", cmap="viridis", vmin=0.0, vmax=1.0)
+            cov_ax_full.set_title(f"Full-res spray need ({full_map.shape[0]}x{full_map.shape[1]})")
 
         cov_suptitle.set_text(f"step {step_i}")
         cov_fig.canvas.draw_idle()
@@ -384,9 +518,9 @@ def main():
         spray_lineset.colors = fresh_lineset.colors
         vis_.update_geometry(spray_lineset)
 
-        # --- NEW: re-point the pink target line at this step's active
-        # region centroid (target_history[i] lines up with path_history[i],
-        # both recorded once per step -- see the rollout loop above).
+        # --- NEW: re-point the pink target line at this step's picked
+        # block (target_history[i] lines up with path_history[i], both
+        # recorded once per step -- see the rollout loop above).
         target_xy = target_history[i] if i < len(target_history) else None
         fresh_target = sim.make_target_lineset(new_pos, target_xy)
         target_lineset.points = fresh_target.points

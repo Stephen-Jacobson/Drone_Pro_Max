@@ -132,9 +132,25 @@ class DroneEnv(EnvBase):
         # net's in_keys=["coverage_map", "flat"] expect. coverage_map is now
         # a 2-channel downscaled map (see _build_coverage_map) instead
         # of the old 3-channel full-resolution map a CNN used to chew on.
+        #
+        # NEW: density_map_full + drone_xy. coverage_map's channel 0 is
+        # only the DOWNSCALED spray-need map (e.g. 8x8) that the network's
+        # density_direction head reads to pick a t in [0, 1]. Resolving
+        # that t into an actual target block should happen against the
+        # REAL full-resolution grid (e.g. 30x30), not the coarse one --
+        # but pick_block.pick_block() needs that real grid, plus the
+        # drone's real (x, y), as plain per-step data. Since training
+        # batches steps from many parallel envs AND replays old steps from
+        # the buffer (whose envs have long since moved on), there's no
+        # "current env" to query at pick time the way a single live env in
+        # run_model_test.py has -- these two have to travel through the
+        # tensordict/replay buffer like any other observation so each
+        # historical step still carries its OWN correct state.
         self.observation_spec = Composite(
             coverage_map=Unbounded(shape=(2, *self._map_out_hw)),  # channel 0: active-region spray-need, channel 1: drone position -- both downscaled
             flat=Unbounded(shape=(flat_size,)),
+            density_map_full=Unbounded(shape=(map_h, map_w)),  # real full-resolution active-region spray-need map
+            drone_xy=Unbounded(shape=(2,)),  # drone's real (x, y), same coordinate frame as density_map_full
             # NEW: explicit crash flag, separate from "done" (which also fires on
             # successful completion). Not consumed by the CNN (in_keys=["coverage_map",
             # "flat"] only) -- this exists purely so the training loop can log a real
@@ -194,6 +210,8 @@ class DroneEnv(EnvBase):
             {
                 "coverage_map": torch.tensor(obs["coverage_map"], device=self.device),
                 "flat": torch.tensor(obs["flat"], device=self.device),
+                "density_map_full": torch.tensor(obs["density_map_full"], device=self.device),
+                "drone_xy": torch.tensor(obs["drone_xy"], device=self.device),
                 "reward": torch.tensor([reward], dtype=torch.float32, device=self.device),
                 # "done" = episode over for ANY reason (terminated OR truncated).
                 "done": torch.tensor([done], device=self.device),
@@ -252,6 +270,8 @@ class DroneEnv(EnvBase):
             {
                 "coverage_map": torch.tensor(obs["coverage_map"], device=self.device),
                 "flat": torch.tensor(obs["flat"], device=self.device),
+                "density_map_full": torch.tensor(obs["density_map_full"], device=self.device),
+                "drone_xy": torch.tensor(obs["drone_xy"], device=self.device),
                 "crashed": torch.tensor([0.0], dtype=torch.float32, device=self.device),
             },
             batch_size=[],
@@ -269,7 +289,15 @@ class DroneEnv(EnvBase):
 
         coverage_map = self._build_coverage_map()
 
-        return {"coverage_map": coverage_map, "flat": flat}
+        return {
+            "coverage_map": coverage_map,
+            "flat": flat,
+            # NEW: real full-resolution grid + drone position, for
+            # pick_block.pick_block() to resolve target blocks against
+            # (see observation_spec comment above).
+            "density_map_full": self.full_res_active_need_map(),
+            "drone_xy": self.drone.pos[:2].astype(np.float32),
+        }
 
     def _remaining_regions(self):
         """Needs-water regions not yet completed/passed and not currently
@@ -304,14 +332,11 @@ class DroneEnv(EnvBase):
             return False
         return bool(labels[x, y] == region_id)
 
-    def _build_coverage_map(self):
-        """(2, h_out, w_out) tensor: two channels, each downscaled/averaged
-        from the full (H, W) footprint down to h_out x w_out -- the same
-        spatial size the old CNN used to reduce the map to internally via
-        its two stride-2 conv layers (see _stride2_conv_out / self._map_out_hw).
-
-        Channel 0 -- "how much does this active-region cell still need
-        spraying". Per full-resolution cell, before downscaling:
+    def full_res_active_need_map(self):
+        """(H, W) full-resolution "active-region spray need" map, at the
+        real terrain resolution (self.spray_tracker.shape -- e.g. 30x30),
+        NOT the coarser downscaled coverage_map channel 0 (e.g. 8x8) the
+        network's density_direction head reads. Per cell:
           - 0.0  outside the active region entirely (any other region, or
                  no active region at all)
           - 0.0  inside the active region but already fully sprayed
@@ -320,6 +345,31 @@ class DroneEnv(EnvBase):
           - fraction in (0, 1]  inside the active region and not yet fully
                  sprayed: 1.0 - completeness, i.e. how much spraying is
                  still needed there (1.0 = untouched, near 0 = nearly done)
+
+        Exposed separately (rather than only living inline in
+        _build_coverage_map) so callers like run_model_test.py can hand
+        pick_block.pick_block() the REAL grid to choose a target block
+        from, instead of the coarser one the network itself sees.
+        """
+        st = self.spray_tracker
+        completeness = np.clip(
+            st.hit_counts / max(st.required_hits_per_cell, 1), 0.0, 1.0
+        ).astype(np.float32)
+        remaining_need = 1.0 - completeness
+
+        need_channel = np.zeros(st.shape, dtype=np.float32)
+        if self.active_region_id is not None:
+            active_mask = (st.labels == self.active_region_id)
+            need_channel[active_mask] = remaining_need[active_mask]
+        return need_channel
+
+    def _build_coverage_map(self):
+        """(2, h_out, w_out) tensor: two channels, each downscaled/averaged
+        from the full (H, W) footprint down to h_out x w_out -- the same
+        spatial size the old CNN used to reduce the map to internally via
+        its two stride-2 conv layers (see _stride2_conv_out / self._map_out_hw).
+
+        Channel 0 is full_res_active_need_map() above, downscaled.
 
         Channel 1 -- drone position. A single 1.0 at the drone's current
         (x, y) cell, 0 everywhere else, BEFORE downscaling -- i.e. a soft
@@ -339,23 +389,14 @@ class DroneEnv(EnvBase):
         fractions (or straddling the position spike) comes out as their
         true mean rather than being rounded or truncated.
         """
-        st = self.spray_tracker
-        completeness = np.clip(
-            st.hit_counts / max(st.required_hits_per_cell, 1), 0.0, 1.0
-        ).astype(np.float32)
-        remaining_need = 1.0 - completeness
-
-        need_channel = np.zeros(st.shape, dtype=np.float32)
-        if self.active_region_id is not None:
-            active_mask = (st.labels == self.active_region_id)
-            need_channel[active_mask] = remaining_need[active_mask]
+        need_channel = self.full_res_active_need_map()
 
         # Drone position is a float (self.drone.pos can sit mid-cell) so
         # this clamps/rounds to the nearest valid cell rather than assuming
         # int(pos) is always safe to index.
-        pos_channel = np.zeros(st.shape, dtype=np.float32)
-        px = int(np.clip(round(float(self.drone.pos[0])), 0, st.shape[0] - 1))
-        py = int(np.clip(round(float(self.drone.pos[1])), 0, st.shape[1] - 1))
+        pos_channel = np.zeros(need_channel.shape, dtype=np.float32)
+        px = int(np.clip(round(float(self.drone.pos[0])), 0, need_channel.shape[0] - 1))
+        py = int(np.clip(round(float(self.drone.pos[1])), 0, need_channel.shape[1] - 1))
         pos_channel[px, py] = 1.0
 
         # (2, H, W) -> average-pool down to (2, h_out, w_out), each channel independently
@@ -366,7 +407,7 @@ class DroneEnv(EnvBase):
     # --- reward tuning constants -- all in one place so they're easy to find/adjust ---
     CRASH_PENALTY = -8                 # hitting terrain/trees/out-of-bounds
     STEP_COST = 0.1                    # tiny per-step cost, discourages stalling
-    OVERSPRAY_PENALTY_PER_HIT = 0.00     # per spray-ray hit landed on a no-water region
+    OVERSPRAY_PENALTY_PER_HIT = 0.001     # per spray-ray hit landed on a no-water region
     SPRAY_HIT_REWARD_PER_HIT = 0.01     # per spray-ray hit landed on a needs-water region (up to its cap)
     PROGRESS_REWARD_SCALE = 0.0           # multiplier on step-to-step completeness delta
     REGION_COMPLETE_BONUS = 12.0          # one-time bonus, paid the step the ACTIVE (pink-line-targeted) region finishes
@@ -388,8 +429,8 @@ class DroneEnv(EnvBase):
     # of each stage -- flat within a stage, step up at the boundary.
     # All three are decided/changeable here in one place:
     REGION_DONE_THRESHOLD_START = 0.01      # threshold used during stage 0 (start of training)
-    REGION_DONE_THRESHOLD_END = 0.50        # threshold used during the final stage
-    REGION_DONE_THRESHOLD_INTERVALS = 8     # number of stepped stages spanning the whole run
+    REGION_DONE_THRESHOLD_END = 0.90        # threshold used during the final stage
+    REGION_DONE_THRESHOLD_INTERVALS = 20     # number of stepped stages spanning the whole run
 
     @staticmethod
     def region_done_threshold_for_progress(progress, start=None, end=None, n_intervals=None):
