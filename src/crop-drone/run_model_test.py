@@ -22,7 +22,7 @@ import pick_block
 
 MAX_STEPS = 400
 num_cells = 256          # must match rl_model.py
-CHECKPOINT_PATH = os.path.join(os.path.dirname(__file__), "..", "pax_v2_5.pt")
+CHECKPOINT_PATH = os.path.join(os.path.dirname(__file__), "trained_crop_models/pax_v2_5.pt")
 FRAMES_PER_STEP = 10      # adjust this to slow down: higher = slower (1=normal speed)
 TEST_REGION_DONE_THRESHOLD = 0.90
 

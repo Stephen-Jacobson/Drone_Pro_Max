@@ -1,4 +1,3 @@
-# TODO: create model in here to be used by drone
 import os
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import numpy as np

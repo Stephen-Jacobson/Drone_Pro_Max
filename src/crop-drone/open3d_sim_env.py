@@ -1,6 +1,7 @@
-import os                                       # have to do this so it works for me, idk why, delete if it messes with things
+import os, sys                                       # have to do this so it works for me, idk why, delete if it messes with things
 os.environ["__NV_PRIME_RENDER_OFFLOAD"] = "1"
 os.environ["__GLX_VENDOR_LIBRARY_NAME"] = "nvidia"
+sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
 import numpy as np
 from noise import pnoise2
@@ -121,9 +122,6 @@ def generate_voxels(scale=30.0, octaves=6, persistence=0.6, lacunarity=1.0, seed
             top1 = surface_idx + 1  # slice end is exclusive
             voxels[i, j, top0:top1] = 1  # topsoil (near surface)
 
-    # ── 3. Worms carve caves directly into the voxel grid ──────────────────
-    # apply_perlin_worms will set carved voxels to 0 (air)
-    # voxels = apply_perlin_worms(voxels, z_grid, num_worms=num_worms, worm_length=worm_length, radius=worm_radius, seed=seed)
     generate_random_crop_plots(voxels, 3, 3)
     return voxels
 
@@ -426,81 +424,6 @@ def generate_terrain(scale=10.0, octaves=6, persistence=0.5, lacunarity=2.0, see
                               num_worms, worm_length, worm_radius)
     return mesh_from_voxels(voxels)
 
-
-def apply_perlin_worms(voxels, z_grid, num_worms=6, worm_length=250, radius=1.6, seed=0,
-                        turn_h=0.15, turn_v=0.05):
-    """Simple "drunk worm" cave carver: a point wanders through the solid
-    terrain and a sphere of voxels is deleted around it at every step --
-    exactly the "point moves, blocks disappear around it" idea. Two things
-    were broken in the original version:
-
-      1. Worms started at a fixed global z-range that often landed in open
-         air for low-terrain columns, so nothing got carved.
-      2. Worms `break`-ed the moment they touched the edge of the (small,
-         30x30) map -- most worms died after ~15-25 of their 200 steps,
-         carving almost nothing.
-
-    Fixed by starting each worm relative to the *local* terrain height (so
-    it always starts inside solid rock) and by having worms bounce off the
-    map edges instead of dying, so every worm uses its full length.
-    """
-    rng = np.random.RandomState(seed)
-    voxels = voxels.copy()
-    margin = radius + 1.5  # keep the worm (and its carve-sphere) inside the grid
-
-    for _ in range(num_worms):
-        # Start somewhere inside solid rock, relative to the LOCAL terrain
-        # height at that (x, y) -- not a fixed global range -- so the worm
-        # never starts stranded in open air.
-        x = rng.uniform(margin, max_x - margin)
-        y = rng.uniform(margin, max_y - margin)
-        local_h = max(z_grid[int(x), int(y)], margin * 2 + 1)
-        z = rng.uniform(margin, max(local_h - margin, margin + 1))
-
-        angle_h = rng.uniform(0, 2 * np.pi)   # horizontal heading
-        angle_v = rng.uniform(-0.2, 0.2)       # vertical tilt
-        r = radius
-
-        for _ in range(worm_length):
-            # Carve a sphere of `radius` voxels at current position
-            ix, iy, iz = int(x), int(y), int(z)
-            x0, x1 = max(0, int(ix - r)), min(max_x, int(ix + r + 1))
-            y0, y1 = max(0, int(iy - r)), min(max_y, int(iy + r + 1))
-            z0, z1 = max(0, int(iz - r)), min(GRID_DEPTH, int(iz + r + 1))
-
-            cx, cy, cz = np.ogrid[x0:x1, y0:y1, z0:z1]
-            sphere = (cx - x)**2 + (cy - y)**2 + (cz - z)**2 <= r**2
-            # carve by setting material ID to 0 (air)
-            sub = voxels[x0:x1, y0:y1, z0:z1]
-            sub[sphere] = 0
-            voxels[x0:x1, y0:y1, z0:z1] = sub
-
-            # Nudge direction (small turns -> long winding tunnels rather
-            # than tight round blobs; Perlin would go here too, random walk is fine)
-            angle_h += rng.uniform(-turn_h, turn_h)
-            angle_v += rng.uniform(-turn_v, turn_v)
-            angle_v  = np.clip(angle_v, -0.4, 0.4)   # keep mostly horizontal
-
-            nx = x + np.cos(angle_h) * np.cos(angle_v)
-            ny = y + np.sin(angle_h) * np.cos(angle_v)
-            nz = z + np.sin(angle_v)
-
-            # Bounce off the boundary instead of dying, so the worm actually
-            # uses its full length instead of stopping after a few steps.
-            if nx <= margin or nx >= max_x - margin:
-                angle_h = np.pi - angle_h
-            if ny <= margin or ny >= max_y - margin:
-                angle_h = -angle_h
-            if nz <= margin or nz >= GRID_DEPTH - margin:
-                angle_v = -angle_v
-
-            x = np.clip(x + np.cos(angle_h) * np.cos(angle_v), margin, max_x - margin)
-            y = np.clip(y + np.sin(angle_h) * np.cos(angle_v), margin, max_y - margin)
-            z = np.clip(z + np.sin(angle_v), margin, GRID_DEPTH - margin)
-
-    return voxels
-
-
 def make_spray_lineset(origin, hit_xyz, color=(0.0, 1.0, 0.0)):
     """Build a LineSet of bright green segments from the drone's spray
     origin out to each ground point its spray rays hit, so the water spray
@@ -584,7 +507,7 @@ def make_drone_mesh(drone, radius=0.4):
 
 
 def run_simulation():
-    SHOW_AS = "v"   # "m" = smooth marching-cubes surface, "v" = blocky cubes
+    SHOW_AS = "v"   # "m" = smooth marching-cubes surface, "v" = blocky cubes voxel
 
     voxels = generate_voxels()
     labels, count = label_path_regions(voxels, path_material=3)
