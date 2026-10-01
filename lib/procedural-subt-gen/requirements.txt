@@ -1,0 +1,10 @@
+git+https://github.com/pvigier/perlin-numpy
+matplotlib
+open3d
+perlin_noise
+pyqt5
+pyvista
+pyvistaqt
+pyyaml
+scipy
+distinctipy

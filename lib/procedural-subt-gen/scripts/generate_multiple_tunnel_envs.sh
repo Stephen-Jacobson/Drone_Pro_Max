@@ -1,0 +1,13 @@
+/home/lorenzo/miniconda3/envs/train_nn/bin/python /home/lorenzo/git/procedural-subt-gen/scripts/generate_one_tunnel_env.py \
+--environments_folder_path  /home/lorenzo/datasets/more_comprehensive_dataset/\
+--names                         st_sh_sm    st_sh_bg    st_rg_sm    st_rg_bg    cv_sh_sm    cv_sh_bg    cv_rg_sm    cv_rg_bg    \
+--tunnel_lengths                200                                                                                             \
+--min_segment_lengths           10                                                                                              \
+--max_segment_lengths           10                                                                                              \
+--horizontal_tendencies_deg     0           0           0           0           20          20          20          20          \
+--horizontal_noises_deg         0                                                                                               \
+--vertical_tendencies_deg       0                                                                                               \
+--vertical_noises_deg           0                                                                                               \
+--radiuses                      3           6           3           6           3           6           3           6           \
+--roughnesses                   0.000001    0.000001    0.1         0.1         0.000001    0.000001    0.1         0.1         \
+--fta_dists                     -1
