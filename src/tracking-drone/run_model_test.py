@@ -80,7 +80,7 @@ def main():
     with torch.no_grad():
         policy(dummy)
 
-    model_path = os.path.join(os.path.dirname(__file__), "..", "pax_v1.1.pt")
+    model_path = os.path.join(os.path.dirname(__file__), "trained_tracking_models", "pax_v1.1.pt")
     checkpoint = torch.load(model_path, map_location=device)
     policy.load_state_dict(checkpoint["policy"])
     policy.eval()

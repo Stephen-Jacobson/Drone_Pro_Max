@@ -1,0 +1,1 @@
+exec python run_model_test.py
